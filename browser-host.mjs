@@ -110,6 +110,43 @@ export async function installNativeFocusReset(context, { onFailure = () => {}, t
   } catch (error) { await close(); throw fault || focusFailure(error); }
 }
 
+// 专用浏览器去掉自动化痕迹：只关掉控制端可见的自动化开关，不改动登录、代理或安全策略。
+const NATIVE_ARGS = [
+  '--remote-debugging-address=127.0.0.1',
+  '--autoplay-policy=no-user-gesture-required',
+  '--disable-blink-features=AutomationControlled',
+];
+const NATIVE_IGNORE_DEFAULT_ARGS = ['--mute-audio', '--enable-automation'];
+
+// 只抹掉「自动化控制」这一类可探测痕迹：不改动语言、时区、分辨率等真实指纹，也不伪造登录。
+// 通过属性描述符重写，避免被 Object.getOwnPropertyDescriptor 一眼看出是被赋值覆盖的。
+export function installNativeStealth() {
+  if (location.protocol !== 'https:' && location.protocol !== 'http:') return;
+  const define = (owner, key, value) => {
+    if (!owner) return;
+    try {
+      const current = Object.getOwnPropertyDescriptor(owner, key);
+      Object.defineProperty(owner, key, { ...(current || {}), configurable: true, get: () => value });
+    } catch { /* 已冻结的对象不再强行改写，避免破坏页面。 */ }
+  };
+  define(Navigator.prototype, 'webdriver', false);
+  // Playwright/CDP 注入的痕迹字段，正常浏览器里不存在。
+  for (const key of ['__playwright', '__pw_manual', '__PW_inspect', 'cdc_adoQpoasnfa76pfcZLmcfl_Array', 'cdc_adoQpoasnfa76pfcZLmcfl_Promise', 'cdc_adoQpoasnfa76pfcZLmcfl_Symbol']) {
+    try { delete window[key]; } catch { /* 不可删除时不报错。 */ }
+  }
+  // 无头/自动化环境常缺失的常规能力，补齐成普通桌面 Edge 的样子。
+  if (!navigator.languages || !navigator.languages.length) define(Navigator.prototype, 'languages', ['zh-CN', 'zh']);
+  if (navigator.plugins && navigator.plugins.length === 0) {
+    try {
+      const plugins = [{ name: 'PDF Viewer' }, { name: 'Chrome PDF Viewer' }, { name: 'Chromium PDF Viewer' }];
+      Object.defineProperty(Navigator.prototype, 'plugins', { configurable: true, get: () => plugins });
+    } catch { /* 保持原样。 */ }
+  }
+  if (!navigator.mimeTypes?.length) {
+    try { Object.defineProperty(Navigator.prototype, 'mimeTypes', { configurable: true, get: () => [{ type: 'application/pdf' }] }); } catch { /* 保持原样。 */ }
+  }
+}
+
 export async function runBrowserHost({ profile, controlDir, port, chromiumImpl = chromium, probeInstallation = probeEdgeInstallation, logger = console, processImpl = process } = {}) {
   if (!profile || !controlDir || !Number.isInteger(port) || port < 1024 || port > 65535) return { started: false, exitCode: 2 };
   mkdirSync(controlDir, { recursive: true });
@@ -123,9 +160,11 @@ export async function runBrowserHost({ profile, controlDir, port, chromiumImpl =
     writeState(false);
     try { installation = await probeInstallation(); } catch {}
     context = await chromiumImpl.launchPersistentContext(profile, {
-      channel: 'msedge', headless: false, viewport: null, ignoreDefaultArgs: ['--mute-audio'],
-      args: [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1', '--autoplay-policy=no-user-gesture-required'],
+      channel: 'msedge', headless: false, viewport: null, ignoreDefaultArgs: NATIVE_IGNORE_DEFAULT_ARGS,
+      args: [`--remote-debugging-port=${port}`, ...NATIVE_ARGS],
     });
+    // 每个新页面在导航前就注入，避免首帧之后才补齐留下可探测窗口。
+    try { await context.addInitScript(installNativeStealth); } catch { /* 注入失败不阻断启动，如实记录。 */ }
     const nativeFocus = await installNativeFocusReset(context, { onFailure: error => {
       focusFailed = true;
       const failure = { code: 'EDGE_FOCUS_RESET_FAILED', message: error.message, browserVersion: versionOf(installation?.version), details: sanitizeBrowserFailure(error.cause?.stack || error.cause?.message || error.message) };

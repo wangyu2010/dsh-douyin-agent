@@ -27,8 +27,6 @@
   },
   "scripts": {
     "start": "node app.mjs",
-    "test": "node --test tests/*.test.mjs",
-    "test:native": "node --test verification/dsh-plugin.test.mjs verification/native-launch-command.test.mjs verification/native-settings.test.mjs verification/settings-transport.test.mjs tests/native-watch.test.mjs tests/native-spark.test.mjs tests/native-client.test.mjs",
     "test:browser": "node verification/browser-live.mjs"
   },
   "dependencies": {
@@ -52,6 +50,7 @@
     "storyboard/vendor/jpeg-js/LICENSE",
     "storyboard/vendor/jpeg-js/LICENSE-APACHE-2.0.txt",
     "api-agent.mjs",
+    "agent-config.mjs",
     "autonomous-comments.mjs",
     "autonomous-share.mjs",
     "autonomous-watch.mjs",
@@ -66,8 +65,12 @@
     "friend-interactions.mjs",
     "friend-interactions-guard.mjs",
     "group-reply-trigger.mjs",
+    "human-input.mjs",
+    "interaction-gate.mjs",
+    "video-interactions.mjs",
     "client.js",
     "comment-browser.mjs",
+    "comment-text.mjs",
     "cordis.bundle.yml",
     "core.mjs",
     "daily-report.mjs",

@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 
 const DAY = 86_400_000;
 const SOURCES = ['api', 'dsh'];
-const READ_ACTIONS = new Set(['douyin_status', 'douyin_pause', 'douyin_recall', 'douyin_remember', 'douyin_video_limits_status']);
+const READ_ACTIONS = new Set(['douyin_status', 'douyin_pause', 'douyin_recall', 'douyin_remember', 'douyin_config', 'douyin_video_limits_status']);
 export const DEFAULT_VIDEO_POLICY = Object.freeze({ version: 1, timeZone: 'Asia/Shanghai', enabled:false, windows: ['00:00-24:00'], dailyMinutes: 10, dailyRequests:30 });
 const shanghai = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -100,7 +100,9 @@ export class VideoLimits {
     const usage=this.accrue(this.usage(),policy,now),budget=this.budget(),date=dateKey(now),usedSeconds=usage.days[date]||0,requests=budget.days[date]||0;
     const remainingSeconds=policy.dailyMinutes===null?null:Math.max(0,policy.dailyMinutes*60-usedSeconds),remainingRequests=policy.dailyRequests===null?null:Math.max(0,policy.dailyRequests-requests),window=allowedWindow(policy,now);
     const worker=optional(path.join(this.stateDir,'watch-loop.lock'),null),saved=optional(path.join(this.stateDir,'watch-state.json'),null),lastRequestPending=worker&&Number.isSafeInteger(worker.pid)&&worker.pid>0&&alive(worker.pid)&&Number.isFinite(worker.heartbeatAt)&&now-worker.heartbeatAt>=0&&now-worker.heartbeatAt<5000&&saved?.pendingRequests===1&&['model','comment-model'].includes(saved.phase)&&typeof worker.runId==='string'&&saved.runId===worker.runId&&saved.sessionId===worker.sessionId&&saved.source===worker.source;
-    let reason='',reasonCode='';if(!policy.enabled){reason='允许观看已关闭。';reasonCode='disabled';}else if(!window){reason='当前不在允许刷视频的时间段。';reasonCode='outside-window';}else if(remainingSeconds!==null&&remainingSeconds<=0){reason='今天的观看时长已用完，等待上海时间次日恢复。';reasonCode='daily-time';}else if(remainingRequests!==null&&remainingRequests<=0&&!lastRequestPending){reason='今天的观看模型请求次数已用完，等待上海时间次日恢复。';reasonCode='daily-requests';}
+    // 只剩一个真开关：允许观看。时段、每日时长、每日请求次数都不再拦截，只做统计。
+    // 频度控制交给互动闸门（每轮/每日上限 + 随机间隔），那才是防流控该管的地方。
+    let reason='',reasonCode='';if(!policy.enabled){reason='允许观看已关闭。';reasonCode='disabled';}
     const expiresAt=window?window.expiresAt:null,session=sessions.current?{...sessions.current,expiresAt}:null;
     return{protocol:'video-limits-v2',timeZone:'Asia/Shanghai',now,policy,session,window,allowed:!reason,reason,reasonCode,daily:{date,usedSeconds,remainingSeconds,requests,remainingRequests,timeLimitMinutes:policy.dailyMinutes,requestLimit:policy.dailyRequests},remainingSeconds:reason?0:remainingSeconds===null?expiresAt===null?null:Math.max(0,(expiresAt-now)/1000):expiresAt===null?remainingSeconds:Math.min(remainingSeconds,Math.max(0,(expiresAt-now)/1000))};
   }
@@ -129,7 +131,8 @@ export class VideoLimits {
     if(source!==undefined)sourceName(source);return this.control(()=>{const usage=this.accrue(this.usage(),this.policy(),this.now());if(!source||usage.active?.source===source&&(!ownerId||usage.active.ownerId===ownerId))usage.active=null;write(this.usageFile,usage);return this.state();});
   }
   reserveRequest({sessionId,source='api'}={}) {
-    sourceName(source);return this.control(()=>{const state=this.state();if(!state.allowed||state.daily.remainingRequests===0)throw Object.assign(new Error(state.reason||'今天的观看模型请求次数已用完。'),{watchStatus:'limited',status:409});const budget=this.budget(),key=state.daily.date;budget.days[key]=(budget.days[key]||0)+1;if(sessionId){budget.sessions[sessionId]||={requests:0,maxRequests:null};budget.sessions[sessionId].requests++;}write(this.budgetFile,budget);return{date:key,requests:budget.days[key],remaining:state.policy.dailyRequests===null?null:Math.max(0,state.policy.dailyRequests-budget.days[key])};});
+    // 请求次数只统计不拦截；只有「允许观看关闭」才拒绝。
+    sourceName(source);return this.control(()=>{const state=this.state();if(!state.allowed)throw Object.assign(new Error(state.reason||'允许观看已关闭。'),{watchStatus:'limited',status:409});const budget=this.budget(),key=state.daily.date;budget.days[key]=(budget.days[key]||0)+1;if(sessionId){budget.sessions[sessionId]||={requests:0,maxRequests:null};budget.sessions[sessionId].requests++;}write(this.budgetFile,budget);return{date:key,requests:budget.days[key],remaining:null};});
   }
   beforeAction(source,name) {
     sourceName(source);if(name.startsWith('douyin_chat_'))return{allowed:true};if(READ_ACTIONS.has(name)){try{return{allowed:true,state:this.state()};}catch(error){return{allowed:true,state:{allowed:false,reason:error.message}};}}

@@ -2,6 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
+import { prepareCommentText, validateCommentText } from './comment-text.mjs';
+
+// 评论文字规则与清洗入口集中在 comment-text.mjs，避免发布器与记录校验各写一份。
+export { prepareCommentText, sanitizeCommentText, validateCommentText } from './comment-text.mjs';
 
 const fail = (message, status = 409) => Object.assign(new Error(message), { status });
 const day = now => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(now));
@@ -20,13 +24,7 @@ function write(file, value) {
   finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
 }
 
-export function validateCommentText(value) {
-  if (typeof value !== 'string' || !value.trim() || [...value.trim()].length > 200 || /[\x00-\x1f\x7f\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/.test(value)) throw fail('评论须为 1 至 200 字的单段纯文字。', 400);
-  const text = value.trim(), folded = text.normalize('NFKC');
-  if (/[@＠]|https?:|www\.|(?:[a-z0-9-]+\.)+(?:com|cn|net|org|io|dev|app|me|top|xyz|co|tv)\b|(?:\d[\s-]*){7,}|sk[-_][a-z0-9_-]{6,}|api[\s_-]*key|token|cookie|password|密钥|口令|验证码|身份证|手机号|手机号码|QQ|微信|私信|联系人|好友|账号/iu.test(folded)) throw fail('公开评论不能包含@、链接、联系方式、密钥或私人聊天与好友信息。', 400);
-  if (/(?:我|我们|大肥鱼).{0,8}(?:保证|承诺|负责|一定(?:会|帮|给|送)|会(?:联系|见面|到场|付款|购买|送|转账|打钱|帮你))|(?:我|我们).{0,6}(?:亲自|实测|用过|去过|见过|买过|吃过|听完|看完)/u.test(folded)) throw fail('评论只能谈当前有限观察，不能编造现实经历或作现实承诺。', 400);
-  return text;
-}
+
 
 // 只在已开始的有限自主观看中评论当前观察作品；共享预算和去重记录不因重启重置。
 export class AutonomousComments {
@@ -46,12 +44,13 @@ export class AutonomousComments {
   control(action) { const release = this.acquireControl(); try { return action(); } finally { release(); } }
   policy() {
     const value = read(this.files.policy, { version: 1, enabled: false, dailyLimit: 3, perSessionLimit: 1 });
-    if (!value || value.version !== 1 || typeof value.enabled !== 'boolean' || !Number.isSafeInteger(value.dailyLimit) || value.dailyLimit < 1 || value.dailyLimit > 20 || !Number.isSafeInteger(value.perSessionLimit) || value.perSessionLimit < 1 || value.perSessionLimit > 3) throw fail('自主评论许可或次数上限损坏，未继续评论。');
-    return value;
+    // visualCheck 缺省为 true：老记录不受影响，仍走带画面的前置检查。
+    if (!value || value.version !== 1 || typeof value.enabled !== 'boolean' || !Number.isSafeInteger(value.dailyLimit) || value.dailyLimit < 1 || value.dailyLimit > 20 || !Number.isSafeInteger(value.perSessionLimit) || value.perSessionLimit < 1 || value.perSessionLimit > 3 || value.visualCheck !== undefined && typeof value.visualCheck !== 'boolean') throw fail('自主评论许可或次数上限损坏，未继续评论。');
+    return { ...value, visualCheck: value.visualCheck !== false };
   }
   ledger() {
     const value = read(this.files.ledger, { version: 1, days: {}, sessions: {}, operations: [] });
-    if (!value || value.version !== 1 || !value.days || typeof value.days !== 'object' || Array.isArray(value.days) || !value.sessions || typeof value.sessions !== 'object' || Array.isArray(value.sessions) || [...Object.values(value.days), ...Object.values(value.sessions)].some(count => !Number.isSafeInteger(count) || count < 0) || !Array.isArray(value.operations) || value.operations.some(item => !item || !identifier(item.operationId) || !statuses.has(item.status) || !videoIdentity(item.videoId) || !evidencePattern.test(item.evidenceId) || !identifier(item.sessionId) || !identifier(item.runId) || !/^\d{4}-\d{2}-\d{2}$/.test(item.day) || !['api', 'dsh'].includes(item.source) || !Number.isSafeInteger(item.pid) || item.pid < 1 || typeof item.text !== 'string' || [...item.text].length < 1 || [...item.text].length > 200 || item.status === 'confirmed' && !identifier(item.commentId)) || new Set(value.operations.map(item => item.operationId)).size !== value.operations.length || new Set(value.operations.map(item => item.videoId)).size !== value.operations.length) throw fail('自主评论预算或收据损坏，未重新计数。');
+    if (!value || value.version !== 1 || !value.days || typeof value.days !== 'object' || Array.isArray(value.days) || !value.sessions || typeof value.sessions !== 'object' || Array.isArray(value.sessions) || [...Object.values(value.days), ...Object.values(value.sessions)].some(count => !Number.isSafeInteger(count) || count < 0) || !Array.isArray(value.operations) || value.operations.some(item => !item || !identifier(item.operationId) || !statuses.has(item.status) || !videoIdentity(item.videoId) || !(item.evidenceId === undefined || item.evidenceId === '' || evidencePattern.test(item.evidenceId)) || !identifier(item.sessionId) || !identifier(item.runId) || !/^\d{4}-\d{2}-\d{2}$/.test(item.day) || !['api', 'dsh'].includes(item.source) || !Number.isSafeInteger(item.pid) || item.pid < 1 || typeof item.text !== 'string' || [...item.text].length < 1 || [...item.text].length > 200 || item.status === 'confirmed' && !identifier(item.commentId)) || new Set(value.operations.map(item => item.operationId)).size !== value.operations.length || new Set(value.operations.map(item => item.videoId)).size !== value.operations.length) throw fail('自主评论预算或收据损坏，未重新计数。');
     const days = {}, sessions = {};
     for (const operation of value.operations) { days[operation.day] = (days[operation.day] || 0) + 1; sessions[operation.sessionId] = (sessions[operation.sessionId] || 0) + 1; }
     if (Object.entries(days).some(([key, count]) => (value.days[key] || 0) < count) || Object.entries(sessions).some(([key, count]) => (value.sessions[key] || 0) < count)) throw fail('评论预算小于已有处理记录，未重置次数。');
@@ -62,13 +61,13 @@ export class AutonomousComments {
     const policy = this.policy(), ledger = this.ledger(), date = day(this.now()), time = this.videoLimits.state(), sessionId = time.session?.id || null, guard = read(this.files.send, null);
     if (guard && (!Number.isSafeInteger(guard.pid) || guard.pid < 1 || !identifier(guard.token))) throw fail('评论发送锁损坏，请先核对收据。');
     const recoveryRequired = Boolean(guard && !alive(guard.pid)), unresolved = this.unresolved(ledger);
-    return { protocol: 'autonomous-comments-v1', enabled: policy.enabled, policy: { enabled: policy.enabled, dailyLimit: policy.dailyLimit, perSessionLimit: policy.perSessionLimit }, timeZone: 'Asia/Shanghai', daily: { date, attempts: ledger.days[date] || 0, remaining: Math.max(0, policy.dailyLimit - (ledger.days[date] || 0)) }, session: { id: sessionId, attempts: sessionId ? ledger.sessions[sessionId] || 0 : 0, remaining: sessionId ? Math.max(0, policy.perSessionLimit - (ledger.sessions[sessionId] || 0)) : 0 }, paused: unresolved.length > 0 || recoveryRequired, busy: Boolean(guard && alive(guard.pid)), recoveryRequired, needsReview: unresolved.map(({ operationId, videoId, sessionId, status, startedAt, browserOperationId }) => ({ operationId, videoId, sessionId, status, startedAt, browserOperationId })), recent: ledger.operations.slice(-10).map(({ operationId, videoId, sessionId, status, startedAt, completedAt, text, commentId }) => ({ operationId, videoId, sessionId, status, startedAt, completedAt, text, commentId })), receiptsFile: this.files.ledger };
+    return { protocol: 'autonomous-comments-v1', enabled: policy.enabled, visualCheck: policy.visualCheck, policy: { enabled: policy.enabled, visualCheck: policy.visualCheck, dailyLimit: policy.dailyLimit, perSessionLimit: policy.perSessionLimit }, timeZone: 'Asia/Shanghai', daily: { date, attempts: ledger.days[date] || 0, remaining: Math.max(0, policy.dailyLimit - (ledger.days[date] || 0)) }, session: { id: sessionId, attempts: sessionId ? ledger.sessions[sessionId] || 0 : 0, remaining: sessionId ? Math.max(0, policy.perSessionLimit - (ledger.sessions[sessionId] || 0)) : 0 }, paused: unresolved.length > 0 || recoveryRequired, busy: Boolean(guard && alive(guard.pid)), recoveryRequired, needsReview: unresolved.map(({ operationId, videoId, sessionId, status, startedAt, browserOperationId }) => ({ operationId, videoId, sessionId, status, startedAt, browserOperationId })), recent: ledger.operations.slice(-10).map(({ operationId, videoId, sessionId, status, startedAt, completedAt, text, commentId }) => ({ operationId, videoId, sessionId, status, startedAt, completedAt, text, commentId })), receiptsFile: this.files.ledger };
   }
-  context() { const state = this.state(); return { enabled: Boolean(state.enabled && !state.paused && state.daily.remaining > 0 && state.session.remaining > 0 && this.videoLimits.state().allowed), remainingDaily: state.daily.remaining, remainingSession: state.session.remaining, paused: state.paused, maxTextLength: 200 }; }
+  context() { const state = this.state(); return { enabled: Boolean(state.enabled && !state.paused && state.daily.remaining > 0 && state.session.remaining > 0 && this.videoLimits.state().allowed), visualCheck: state.visualCheck, remainingDaily: state.daily.remaining, remainingSession: state.session.remaining, paused: state.paused, maxTextLength: 200 }; }
   configure(input = {}, { explicit = false } = {}) {
     if (!explicit) throw fail('自主评论许可只能由用户在本机设置。', 403);
-    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['enabled', 'dailyLimit', 'perSessionLimit'].includes(key)) || typeof input.enabled !== 'boolean' || input.dailyLimit !== undefined && (!Number.isSafeInteger(input.dailyLimit) || input.dailyLimit < 1 || input.dailyLimit > 20) || input.perSessionLimit !== undefined && (!Number.isSafeInteger(input.perSessionLimit) || input.perSessionLimit < 1 || input.perSessionLimit > 3)) throw fail('评论设置只接受总开关、每日 1 至 20 次和单轮 1 至 3 次上限。', 400);
-    this.control(() => { const policy = this.policy(); if (input.enabled && (this.unresolved().length || this.state().recoveryRequired)) throw fail('上次评论结果需要核对；重新开关不能清除未确认记录。'); write(this.files.policy, { ...policy, enabled: input.enabled, dailyLimit: input.dailyLimit ?? policy.dailyLimit, perSessionLimit: input.perSessionLimit ?? policy.perSessionLimit }); });
+    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['enabled', 'dailyLimit', 'perSessionLimit', 'visualCheck'].includes(key)) || typeof input.enabled !== 'boolean' || input.visualCheck !== undefined && typeof input.visualCheck !== 'boolean' || input.dailyLimit !== undefined && (!Number.isSafeInteger(input.dailyLimit) || input.dailyLimit < 1 || input.dailyLimit > 20) || input.perSessionLimit !== undefined && (!Number.isSafeInteger(input.perSessionLimit) || input.perSessionLimit < 1 || input.perSessionLimit > 3)) throw fail('评论设置只接受总开关、截图分析开关、每日 1 至 20 次和单轮 1 至 3 次上限。', 400);
+    this.control(() => { const policy = this.policy(); if (input.enabled && (this.unresolved().length || this.state().recoveryRequired)) throw fail('上次评论结果需要核对；重新开关不能清除未确认记录。'); write(this.files.policy, { ...policy, enabled: input.enabled, visualCheck: input.visualCheck ?? policy.visualCheck, dailyLimit: input.dailyLimit ?? policy.dailyLimit, perSessionLimit: input.perSessionLimit ?? policy.perSessionLimit }); });
     if (!input.enabled) this.active?.abort.abort(fail('用户关闭了自主评论。'));
     return this.state();
   }
@@ -95,13 +94,23 @@ export class AutonomousComments {
     const own = operationId && ledger.operations.find(item => item.operationId === operationId), count = ledger.days[day(this.now())] || 0, sessionCount = ledger.sessions[time.session.id] || 0;
     if (own && own.day !== day(this.now())) throw fail('已跨过上海日期，本次评论预留不转移到新一天。');
     if (count >= policy.dailyLimit && (!own || count > policy.dailyLimit) || sessionCount >= policy.perSessionLimit && (!own || sessionCount > policy.perSessionLimit)) throw fail('自主评论的每日或单轮次数已用完。');
-    this.evidence(input); validateCommentText(input.text); this.privateContent(input.text);
+    // 截图前置检查关闭时只按作品身份核对：不要求本次有画面采样，次数上限照常生效。
+    if (policy.visualCheck) this.evidence(input); else this.videoOnly(input);
+    validateCommentText(input.text); this.privateContent(input.text);
     return time;
+  }
+  videoOnly(input) {
+    if (!videoIdentity(input.videoId)) throw fail('评论必须指定当前抖音作品。', 400);
+    if (input.evidenceId !== undefined && !evidencePattern.test(input.evidenceId)) throw fail('评论观察编号格式无效。', 400);
+    return true;
   }
   update(operationId, patch) { return this.control(() => { const ledger = this.ledger(), item = ledger.operations.find(item => item.operationId === operationId); if (!item) throw fail('评论预留记录丢失，未继续发布。'); Object.assign(item, patch); write(this.files.ledger, ledger); }); }
   async comment(input = {}, { signal, watchRunId } = {}) {
     if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['evidenceId', 'videoId', 'text'].includes(key))) throw fail('自主评论只接受观察编号、当前作品和纯文字。', 400);
-    input = { ...input, text: validateCommentText(input.text) }; this.allowed(input, { signal, watchRunId });
+    // 截图前置检查关闭时，观察编号可省略；正文仍走同一套公开边界校验。
+    if (!this.policy().visualCheck && input.evidenceId === undefined) input = { ...input, evidenceId: '' };
+    // 特殊字符先机械修复再按公开边界核对；修不成才拒绝，且由观看循环记为跳过。
+    input = { ...input, text: prepareCommentText(input.text) }; this.allowed(input, { signal, watchRunId });
     if (this.active) throw fail('此入口已有评论正在处理。'); fs.mkdirSync(this.stateDir, { recursive: true });
     const token = randomUUID(); let descriptor;
     try { descriptor = fs.openSync(this.files.send, 'wx', 0o600); } catch (error) { if (error.code === 'EEXIST') throw fail('另一个入口正在评论，或上次评论发送锁需要核对。'); throw error; }
@@ -114,8 +123,7 @@ export class AutonomousComments {
         const time = this.allowed(input, { signal: combined, watchRunId }); sessionId = time.session.id; const ledger = this.ledger();
         if (ledger.operations.some(item => item.videoId === input.videoId)) throw fail('同一作品已处理过评论，未跨日或重启后自动重复发布。');
         const date = day(this.now()); ledger.days[date] = (ledger.days[date] || 0) + 1; ledger.sessions[sessionId] = (ledger.sessions[sessionId] || 0) + 1;
-        ledger.operations.push({ operationId, evidenceId: input.evidenceId, videoId: input.videoId, text: input.text, day: date, sessionId, runId: watchRunId, source: this.source, pid: process.pid, status: 'reserved', startedAt: new Date(this.now()).toISOString() }); write(this.files.ledger, ledger); reserved = true;
-      });
+        ledger.operations.push({ operationId, evidenceId: input.evidenceId, videoId: input.videoId, text: input.text, day: date, sessionId, runId: watchRunId, source: this.source, pid: process.pid, status: 'reserved', startedAt: new Date(this.now()).toISOString() }); write(this.files.ledger, ledger); reserved = true;      });
       const authorize = ({ phase, videoId } = {}) => { if (finished || videoId !== input.videoId || !['prepare', 'monitor', 'before-click'].includes(phase)) throw fail('可信评论授权与当前作品不一致。'); this.allowed(input, { signal: combined, watchRunId, operationId, sessionId }); if (phase === 'before-click') { if (clicking) throw fail('这条评论已授权一次发布，未再次点击。'); this.update(operationId, { status: 'clicking' }); clicking = true; } return true; };
       authorize.beginDispatch = () => { if (finished || !clicking || releaseDispatch) throw fail('没有一次有效的评论最终输入许可。'); const release = this.acquireControl(); try { this.allowed(input, { signal: combined, watchRunId, operationId, sessionId }); } catch (error) { release(); throw error; } releaseDispatch = release; return () => { releaseDispatch?.(); releaseDispatch = null; }; };
       let post = this.post;

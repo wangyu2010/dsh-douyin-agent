@@ -9,10 +9,12 @@ import { TOOL_DEFINITIONS, validateToolArguments } from './tool-definitions.mjs?
 import { VideoLimits } from './video-limits.mjs';
 import { resolveRuntimePaths, resolveNodeExecutable } from './runtime-paths.mjs?v=10';
 import { PersonaMemory } from './persona-memory.mjs?v=10';
+import { AgentConfig } from './agent-config.mjs';
 import { BrowserLauncher, connectDedicatedBrowser } from './browser-launcher.mjs';
 import { pauseExistingVideoPages } from './browser-pause.mjs';
 import { browserPageLabel, browserPageLock, findSharedPage, adoptSharedPreparePage } from './browser-pages.mjs';
 import { StoryboardFrameStore } from './video-storyboard.mjs';
+import { humanClick, moveHuman } from './human-input.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const SHARED_CAPTURE_MODE = Symbol('shared-video-frame-capture');
@@ -530,6 +532,11 @@ export class BrowserController {
     this.reportPromise ??= import('./daily-report.mjs?v=10').then(({ DailyReport }) => new DailyReport({ personaMemory: this.getPersonaMemory() })).catch(error => { this.reportPromise = null; throw error; });
     return this.reportPromise;
   }
+  // 配置是同步读写的小文件，直接缓存实例；热读取保证改完立即生效。
+  getAgentConfig() {
+    this.agentConfig ??= new AgentConfig({ stateDir: this.limits().stateDir });
+    return this.agentConfig;
+  }
   getWatchMode() {
     this.modePromise ??= import('./watch-mode.mjs?v=18').then(({ WatchMode }) => new WatchMode({ stateDir: this.limits().stateDir, source: this.source === 'dsh' ? 'dsh' : 'api' }));
     return this.modePromise;
@@ -747,6 +754,16 @@ export class BrowserController {
       }
       if (name === 'douyin_report_status') return (await this.getReport()).state();
       if (name === 'douyin_report_generate') return (await this.getReport()).generate({ reason: 'manual' });
+      // AI 直接改配置：不经过设置界面，不需要人点按钮；改完热生效。
+      if (name === 'douyin_config') {
+        const service = this.getAgentConfig();
+        const action = args.action ?? (args.config === undefined ? 'get' : 'update');
+        if (action === 'get') return { action: 'get', ...service.summarize(), 白话说明: service.describe().text };
+        if (action === 'reset') return { action: 'reset', ...service.reset(), summary: service.summarize(), 白话说明: service.describe().text };
+        if (args.config === undefined) throw new TypeError('修改配置需要提供 config。');
+        const result = service.update(args.config);
+        return { action: 'update', changed: result.changed, notes: result.notes, summary: service.summarize(), 白话说明: service.describe().text };
+      }
       if(name==='douyin_media_status') return (await this.getMediaAdapter()).status();
       if(name==='douyin_forward_video') {
         if(humanAuthorized!==true) return {sent:false,requiresUserAction:true,note:'请在本机控制台选择这位好友并点击转发；此工具不会代替人类按钮授权。',recipientId:args.recipientId,url:args.url??null};
@@ -979,11 +996,15 @@ export class BrowserController {
       aborted(signal);
       const armInput=()=>this.page.evaluate(currentToken=>{const entry=window.__deepseekVideoSwitchInputs?.[currentToken];if(!entry)return false;entry.armed=true;entry.timer=setTimeout(()=>{entry.expired=true;},1500);return true;},token);
       if(control){
+        // 轨迹先走完再武装事件门禁：见证只有1.5秒，不能被鼠标移动占用。
+        await moveHuman(this.page,{x:finalPoint.clickX,y:finalPoint.clickY});
+        if(!await checkPendingInput())return inputDenied;
+        const hoverPoint=await readPoint();if(!sameGeometry(finalPoint,hoverPoint))return denied(before,'switch-control-changed');
         if(!await armInput())return denied(before,'switch-control-changed');
         aborted(signal);
-        await this.page.mouse.click(finalPoint.clickX,finalPoint.clickY);
+        await this.page.mouse.click(finalPoint.clickX,finalPoint.clickY,{delay:60+Math.round(Math.random()*40)});
       }else{
-        await this.page.mouse.move(finalPoint.clickX,finalPoint.clickY);
+        await moveHuman(this.page,{x:finalPoint.clickX,y:finalPoint.clickY});
         if(!await checkPendingInput())return inputDenied;
         const wheelPoint=await readPoint();if(!sameGeometry(finalPoint,wheelPoint))return denied(before,'switch-control-changed');
         if(!await armInput())return denied(before,'switch-control-changed');

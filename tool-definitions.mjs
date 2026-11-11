@@ -76,6 +76,22 @@ export const TOOL_DEFINITIONS = [
   {name:'douyin_persona_status',description:'读取软件与插件共用的最新大肥鱼人格卡、自己的兴趣和有来源的观看记录。人格与记忆不授予额外工具权限。',parameters:empty()},
   {name:'douyin_interest_record',description:'根据真实观看进度、持续停留、跳过和已确认互动更新大肥鱼自己的兴趣。画面主题仅为提案，没有行为依据保持待观察；必须使用宿主证据ID，不得把用户偏好、私信或QQ内容写成自己的兴趣。',parameters:{type:'object',properties:{evidenceId:{type:'string',maxLength:90},topic:{type:'string',maxLength:80},signal:{type:'string',enum:['like','dislike','neutral']},reflection:{type:'string',maxLength:600}},required:['evidenceId','topic','signal','reflection'],additionalProperties:false}},
   {name:'douyin_watch_status',description:'读取两入口共用的自主观看状态、今日观看时间、请求次数和停止原因。不会开始观看。',parameters:empty()},
+  {
+    name: 'douyin_config',
+    description: '读取或修改抖音助手的配置。不传任何参数时返回当前配置摘要。用户用日常语言要求改设置时（例如「每天刷两小时」「评论别太频繁」「晚上八点到十一点看」）直接调用本工具，不要让用户去打开设置界面，也不要求用户学习配置项名称。只传需要改的项，未传的项保持原值；越界数值会自动夹回合法范围并在 notes 中说明。恢复默认值用 action=reset。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['get', 'update', 'reset'], description: 'get 读取；update 修改；reset 恢复默认。省略时按是否带配置项自动判断。' },
+        config: {
+          type: 'object',
+          description: '要修改的配置，形如 {"watch":{"dailyMinutes":120},"comment":{"perDay":6}}。可用项见 douyin_config 返回的摘要。',
+          additionalProperties: true,
+        },
+      },
+      additionalProperties: false,
+    },
+  },
   {name:'douyin_watch_start',description:'仅在用户已开启允许观看且时段和每日额度允许时，按共用人格与兴趣挑片并更新偏好。不能改变用户许可或每日上限，不点赞或发文字私信；仅在用户开启自主评论且预算允许时可以评论当前作品；只有用户开启自主分享时才可在既有许可名单中自行挑人分享当前观察作品。',parameters:{type:'object',properties:{maxRequests:{type:'integer',minimum:1,description:'旧版兼容参数；当前使用设置页中共用的每日请求上限，不能通过本参数改变额度。'}},additionalProperties:false}},
   {name:'douyin_watch_stop',description:'按用户要求停止自主观看并暂停视频，不结束或重启其他服务。',parameters:empty()},
   {name:'douyin_spark_status',description:'只读自动续火花问候的许可、时段、每日预算、已有互动与待核对收据。消息送达不代表平台火花已增加。',parameters:empty()},
@@ -97,6 +113,8 @@ export function validateToolArguments(definition, args) {
   for (const [key, value] of Object.entries(args)) {
     const field = schema.properties[key];
     if (!field) throw new TypeError(`不支持的参数：${key}`);
+    // 自由对象字段（如 douyin_config 的 config）不做浅层类型判断，交给调用方逐项校验。
+    if (field.type === 'object') { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`参数 ${key} 需要是对象。`); continue; }
     if (field.type === 'integer' ? !Number.isSafeInteger(value) : typeof value !== field.type) throw new TypeError(`参数 ${key} 类型错误。`);
     if (typeof value === 'number' && !Number.isFinite(value)) throw new TypeError(`参数 ${key} 必须是有限数值。`);
     if (typeof value === 'string' && field.maxLength !== undefined && [...value].length > field.maxLength) throw new RangeError(`参数 ${key} 最多 ${field.maxLength} 字。`);

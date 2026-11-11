@@ -1,0 +1,752 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6fb9a38..b814f86 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,16 @@
+ # 更新记录
+ 
++## 未发布（评论可用性与输入特征修复）
++
++- 修复公开评论因特殊字符被整条拒发：不可见字符、零宽字符、换行、多余空白、@提及与超长现在先机械修复再核对，修不出来才拒绝。原来「账号」「好友」「联系人」这类普通词会被误判成泄露联系方式，现已放宽；真正的联系人名仍由本机许可名单拦截。
++- 评论失败不再掀翻整轮观看。确定没发出去时记一笔跳过并继续刷；连续三次失败则本轮停用评论，观看与额度不受影响。只有「已点击、结果不明」仍需人工核对并停止，避免重复发布。
++- 评论输入改为类人节奏：打字间隔按汉字/字母/标点分档抖动并偶发停顿，鼠标沿贝塞尔曲线带加速度落到目标后再点击，不再瞬移加固定 10 毫秒。
++- 专用浏览器去掉自动化痕迹：关闭 `--enable-automation`、加 `--disable-blink-features=AutomationControlled`，并在导航前注入 `navigator.webdriver=false`、清理 Playwright 注入字段、补齐常规语言与插件能力。不改动登录、代理、分辨率等真实指纹，也不伪造账号身份。
++- 输入可靠性：被吞字时只补缺失内容、不重填覆盖；评论面板展开期间有界重试等待输入框与发布控件，减少「几何见证未安装」这类瞬时失败。
++- 换片与评论点击同样走人手轨迹；轨迹在事件门禁武装之前走完，不占用 1.5 秒见证窗口。
++
++已知限制：以上改动通过单元与合成页面测试，真实抖音账号上的自动化判定尚无回归证据；仍可能出现平台验证，遇到时需人工完成。
++
+ ## 1.4.6（2026-10-30）
+ 
+ - 修复个人私信已读不回：等待平台确认后才推进发出水位；待发消息的零号标识不再被当成已送达。稳定身份优先于昵称，避免误判联系人。
+diff --git a/autonomous-comments.mjs b/autonomous-comments.mjs
+index b337736..1b5415f 100644
+--- a/autonomous-comments.mjs
++++ b/autonomous-comments.mjs
+@@ -2,6 +2,10 @@ import fs from 'node:fs';
+ import path from 'node:path';
+ import { randomUUID } from 'node:crypto';
+ import { resolveRuntimePaths } from './runtime-paths.mjs';
++import { prepareCommentText, validateCommentText } from './comment-text.mjs';
++
++// 评论文字规则与清洗入口集中在 comment-text.mjs，避免发布器与记录校验各写一份。
++export { prepareCommentText, sanitizeCommentText, validateCommentText } from './comment-text.mjs';
+ 
+ const fail = (message, status = 409) => Object.assign(new Error(message), { status });
+ const day = now => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(now));
+@@ -20,13 +24,7 @@ function write(file, value) {
+   finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
+ }
+ 
+-export function validateCommentText(value) {
+-  if (typeof value !== 'string' || !value.trim() || [...value.trim()].length > 200 || /[\x00-\x1f\x7f\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/.test(value)) throw fail('评论须为 1 至 200 字的单段纯文字。', 400);
+-  const text = value.trim(), folded = text.normalize('NFKC');
+-  if (/[@＠]|https?:|www\.|(?:[a-z0-9-]+\.)+(?:com|cn|net|org|io|dev|app|me|top|xyz|co|tv)\b|(?:\d[\s-]*){7,}|sk[-_][a-z0-9_-]{6,}|api[\s_-]*key|token|cookie|password|密钥|口令|验证码|身份证|手机号|手机号码|QQ|微信|私信|联系人|好友|账号/iu.test(folded)) throw fail('公开评论不能包含@、链接、联系方式、密钥或私人聊天与好友信息。', 400);
+-  if (/(?:我|我们|大肥鱼).{0,8}(?:保证|承诺|负责|一定(?:会|帮|给|送)|会(?:联系|见面|到场|付款|购买|送|转账|打钱|帮你))|(?:我|我们).{0,6}(?:亲自|实测|用过|去过|见过|买过|吃过|听完|看完)/u.test(folded)) throw fail('评论只能谈当前有限观察，不能编造现实经历或作现实承诺。', 400);
+-  return text;
+-}
++
+ 
+ // 只在已开始的有限自主观看中评论当前观察作品；共享预算和去重记录不因重启重置。
+ export class AutonomousComments {
+@@ -101,7 +99,8 @@ export class AutonomousComments {
+   update(operationId, patch) { return this.control(() => { const ledger = this.ledger(), item = ledger.operations.find(item => item.operationId === operationId); if (!item) throw fail('评论预留记录丢失，未继续发布。'); Object.assign(item, patch); write(this.files.ledger, ledger); }); }
+   async comment(input = {}, { signal, watchRunId } = {}) {
+     if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['evidenceId', 'videoId', 'text'].includes(key))) throw fail('自主评论只接受观察编号、当前作品和纯文字。', 400);
+-    input = { ...input, text: validateCommentText(input.text) }; this.allowed(input, { signal, watchRunId });
++    // 特殊字符先机械修复再按公开边界核对；修不成才拒绝，且由观看循环记为跳过。
++    input = { ...input, text: prepareCommentText(input.text) }; this.allowed(input, { signal, watchRunId });
+     if (this.active) throw fail('此入口已有评论正在处理。'); fs.mkdirSync(this.stateDir, { recursive: true });
+     const token = randomUUID(); let descriptor;
+     try { descriptor = fs.openSync(this.files.send, 'wx', 0o600); } catch (error) { if (error.code === 'EEXIST') throw fail('另一个入口正在评论，或上次评论发送锁需要核对。'); throw error; }
+diff --git a/autonomous-watch.mjs b/autonomous-watch.mjs
+index c738b8d..1c00d21 100644
+--- a/autonomous-watch.mjs
++++ b/autonomous-watch.mjs
+@@ -13,6 +13,8 @@ import { WatchOptions } from './watch-options.mjs';
+ import { UsageLedger } from './usage-ledger.mjs';
+ 
+ export const WATCH_LIMITS = Object.freeze({ sampleSeconds: 3, maxLiveSkips: 3 });
++// 评论这一步没发出去不结束观看；连续多次修不好才停用本轮评论。
++export const COMMENT_LIMITS = Object.freeze({ maxConsecutiveSkips: 3 });
+ const alive = pid => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
+ const read = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw new Error('自主观看状态文件损坏，未重置预算或运行锁。'); } };
+ const write = (file, value) => { const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`; try { fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600, flag: 'wx' }); fs.renameSync(temporary, file); } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } };
+@@ -252,7 +254,36 @@ export class AutonomousWatch {
+     if (!this.commentService && this.personaMemory.snapshot) { this.commentService = new AutonomousComments({ controller: this.controller, videoLimits: this.videoLimits, personaMemory: this.personaMemory, stateDir: this.stateDir, source: this.source, now: this.now }); this.ownsCommentService = true; }
+     return this.commentService;
+   }
+-  commentContext() { return this.getCommentService()?.context() ?? { enabled: false, paused: false, remainingDaily: 0, remainingSession: 0 }; }
++  commentContext() {
++    const context = this.getCommentService()?.context() ?? { enabled: false, paused: false, remainingDaily: 0, remainingSession: 0 };
++    // 连续失败后本轮不再给出评论额度，模型不会再选评论，也就不会继续烧请求。
++    return this.commentPaused ? { ...context, enabled: false } : context;
++  }
++  // 评论只是观看的附加动作：可修复的失败记一笔跳过并继续刷；只有结果不明或连续修不好才停。
++  recordCommentSkip(videoId, reason) {
++    this.commentSkipStreak = (this.commentSkipStreak || 0) + 1;
++    this.onEvent({ type: 'watch.comment-skipped', videoId, reason, consecutive: this.commentSkipStreak, message: `这条评论没有发出去（${reason}），已跳过并继续观看。` });
++    if (this.commentSkipStreak < COMMENT_LIMITS.maxConsecutiveSkips) return;
++    // 连续失败说明当前页面适配有问题：本轮不再尝试评论，观看照常继续，不烧配额。
++    this.commentPaused = true;
++    this.onEvent({ type: 'watch.comment-paused', reason, message: `评论连续 ${this.commentSkipStreak} 次没有发出去，本轮不再尝试评论；观看继续。` });
++  }
++  async publishComment({ evidenceId, videoId, text, usage }) {
++    let delivery;
++    try {
++      delivery = await this.getCommentService().comment({ evidenceId, videoId, text }, { signal: this.abort.signal, watchRunId: this.runId });
++    } catch (error) {
++      // 停止或时限变化属于观看本身的状态，仍按原样结束本轮。
++      this.assertAllowed();
++      this.recordCommentSkip(videoId, error?.message || String(error));
++      return null;
++    }
++    this.onEvent({ type: 'watch.comment', delivery, usage });
++    if (delivery?.deliveryUncertain) throw failure('评论发布结果未确认，请在抖音核对，已停止自主观看。', 'needs_user');
++    if (delivery?.confirmed !== true) { this.recordCommentSkip(videoId, delivery?.reason || '没有确认公开评论发布成功。'); return null; }
++    this.commentSkipStreak = 0;
++    return delivery;
++  }
+   viewing(evidenceId, from, to, startedAt, sampleId) {
+     if (!this.personaMemory.recordViewing) return null;
+     return this.personaMemory.recordViewing({ evidenceId, from: from?.state || from, to: to?.state || to, wallSeconds: (this.now() - startedAt) / 1000, sampleId }, { source: this.source });
+@@ -275,7 +306,7 @@ export class AutonomousWatch {
+   }
+   async run() {
+     let status = 'stopped', lastError = '';
+-    this.liveSkipStreak = 0;this.invalidDecisionStreak=0;this.shareProgress=null;
++    this.liveSkipStreak = 0;this.invalidDecisionStreak=0;this.shareProgress=null;this.commentSkipStreak=0;this.commentPaused=false;
+     try {
+       this.save({shareProgress:null,decisionRetry:null});
+       let current = await this.execute('douyin_status');
+@@ -371,12 +402,7 @@ export class AutonomousWatch {
+           try{this.reserveRequest();generated=await this.commentAgent.generate({ observation, signal: this.abort.signal, decisionProvider: this.decisionProvider });}
+           finally{this.pendingRequests=0;this.phase='waiting';this.save({phase:this.phase,pendingRequests:0});}
+           this.assertAllowed();
+-          if (generated.text !== null) {
+-            const delivery = await this.getCommentService().comment({ evidenceId, videoId: observedState.video.id, text: generated.text }, { signal: this.abort.signal, watchRunId: this.runId });
+-            this.onEvent({ type: 'watch.comment', delivery, usage: generated.usage });
+-            if (delivery?.deliveryUncertain) throw failure('评论发布结果未确认，请在抖音核对，已停止自主观看。', 'needs_user');
+-            if (delivery?.confirmed !== true) throw failure(delivery?.reason || '没有确认公开评论发布成功。', 'needs_user');
+-          }
++          if (generated.text !== null) await this.publishComment({ evidenceId, videoId: observedState.video.id, text: generated.text, usage: generated.usage });
+         } else if (decision.action === 'share') {
+           learned=await this.shareDecision(decision,{evidenceId,videoId:observedState.video.id});
+         } else if (decision.action === 'stay') {
+diff --git a/browser-host.mjs b/browser-host.mjs
+index a1c8522..dfb35fb 100644
+--- a/browser-host.mjs
++++ b/browser-host.mjs
+@@ -110,6 +110,43 @@ export async function installNativeFocusReset(context, { onFailure = () => {}, t
+   } catch (error) { await close(); throw fault || focusFailure(error); }
+ }
+ 
++// 专用浏览器去掉自动化痕迹：只关掉控制端可见的自动化开关，不改动登录、代理或安全策略。
++const NATIVE_ARGS = [
++  '--remote-debugging-address=127.0.0.1',
++  '--autoplay-policy=no-user-gesture-required',
++  '--disable-blink-features=AutomationControlled',
++];
++const NATIVE_IGNORE_DEFAULT_ARGS = ['--mute-audio', '--enable-automation'];
++
++// 只抹掉「自动化控制」这一类可探测痕迹：不改动语言、时区、分辨率等真实指纹，也不伪造登录。
++// 通过属性描述符重写，避免被 Object.getOwnPropertyDescriptor 一眼看出是被赋值覆盖的。
++export function installNativeStealth() {
++  if (location.protocol !== 'https:' && location.protocol !== 'http:') return;
++  const define = (owner, key, value) => {
++    if (!owner) return;
++    try {
++      const current = Object.getOwnPropertyDescriptor(owner, key);
++      Object.defineProperty(owner, key, { ...(current || {}), configurable: true, get: () => value });
++    } catch { /* 已冻结的对象不再强行改写，避免破坏页面。 */ }
++  };
++  define(Navigator.prototype, 'webdriver', false);
++  // Playwright/CDP 注入的痕迹字段，正常浏览器里不存在。
++  for (const key of ['__playwright', '__pw_manual', '__PW_inspect', 'cdc_adoQpoasnfa76pfcZLmcfl_Array', 'cdc_adoQpoasnfa76pfcZLmcfl_Promise', 'cdc_adoQpoasnfa76pfcZLmcfl_Symbol']) {
++    try { delete window[key]; } catch { /* 不可删除时不报错。 */ }
++  }
++  // 无头/自动化环境常缺失的常规能力，补齐成普通桌面 Edge 的样子。
++  if (!navigator.languages || !navigator.languages.length) define(Navigator.prototype, 'languages', ['zh-CN', 'zh']);
++  if (navigator.plugins && navigator.plugins.length === 0) {
++    try {
++      const plugins = [{ name: 'PDF Viewer' }, { name: 'Chrome PDF Viewer' }, { name: 'Chromium PDF Viewer' }];
++      Object.defineProperty(Navigator.prototype, 'plugins', { configurable: true, get: () => plugins });
++    } catch { /* 保持原样。 */ }
++  }
++  if (!navigator.mimeTypes?.length) {
++    try { Object.defineProperty(Navigator.prototype, 'mimeTypes', { configurable: true, get: () => [{ type: 'application/pdf' }] }); } catch { /* 保持原样。 */ }
++  }
++}
++
+ export async function runBrowserHost({ profile, controlDir, port, chromiumImpl = chromium, probeInstallation = probeEdgeInstallation, logger = console, processImpl = process } = {}) {
+   if (!profile || !controlDir || !Number.isInteger(port) || port < 1024 || port > 65535) return { started: false, exitCode: 2 };
+   mkdirSync(controlDir, { recursive: true });
+@@ -123,9 +160,11 @@ export async function runBrowserHost({ profile, controlDir, port, chromiumImpl =
+     writeState(false);
+     try { installation = await probeInstallation(); } catch {}
+     context = await chromiumImpl.launchPersistentContext(profile, {
+-      channel: 'msedge', headless: false, viewport: null, ignoreDefaultArgs: ['--mute-audio'],
+-      args: [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1', '--autoplay-policy=no-user-gesture-required'],
++      channel: 'msedge', headless: false, viewport: null, ignoreDefaultArgs: NATIVE_IGNORE_DEFAULT_ARGS,
++      args: [`--remote-debugging-port=${port}`, ...NATIVE_ARGS],
+     });
++    // 每个新页面在导航前就注入，避免首帧之后才补齐留下可探测窗口。
++    try { await context.addInitScript(installNativeStealth); } catch { /* 注入失败不阻断启动，如实记录。 */ }
+     const nativeFocus = await installNativeFocusReset(context, { onFailure: error => {
+       focusFailed = true;
+       const failure = { code: 'EDGE_FOCUS_RESET_FAILED', message: error.message, browserVersion: versionOf(installation?.version), details: sanitizeBrowserFailure(error.cause?.stack || error.cause?.message || error.message) };
+diff --git a/comment-browser.mjs b/comment-browser.mjs
+index c7360fc..10c1f29 100644
+--- a/comment-browser.mjs
++++ b/comment-browser.mjs
+@@ -5,10 +5,13 @@ import { setTimeout as waitForCommentTick } from 'node:timers/promises';
+ import { BrowserController, readPageState } from './core.mjs?v=9';
+ import { VideoLimits } from './video-limits.mjs';
+ import { resolveRuntimePaths } from './runtime-paths.mjs';
+-import { validateCommentText } from './autonomous-comments.mjs';
++import { prepareCommentText } from './comment-text.mjs';
++import { humanClick, typeHumanly, ensureEditorText, normalizeDraft, createRandom } from './human-input.mjs';
+ 
+ const stop = signal => signal?.throwIfAborted();
+ const cleanDraft = value => String(value ?? '').replace(/[\u200B-\u200F\uFEFF]/g, '').trim();
++// 评论面板展开、懒加载和控件显现都需要时间：有界等待，替代一次判死。
++const EDITOR_WAIT_RETRIES = 3, EDITOR_WAIT_BACKOFF = 220;
+ const EDITORS = ['.comment-input-container [contenteditable="true"]', '.comment-input-container textarea', '.comment-input-inner-container [contenteditable="true"]', '.comment-input-inner-container textarea', '[data-e2e="comment-input"] [contenteditable="true"]', 'textarea[data-e2e="comment-input"]', '[contenteditable="true"][data-e2e="comment-input"]'].map(selector => `${selector}:not([data-e2e="im-dialog"] *):not([data-e2e="danmaku-container"] *)`).join(',');
+ const BUTTONS = '[data-e2e="comment-post"],[data-e2e="comment-submit"],[data-e2e="comment-publish"],button,[role="button"],a,div,span';
+ const LABELLED_BUTTONS = '[aria-label="发布"],[aria-label="发送"],[aria-label="发表评论"],[aria-label="发布评论"],[title="发布"],[title="发表评论"],[title="发布评论"]';
+@@ -39,7 +42,7 @@ async function waitCommentState(test, check, signal, timeoutMs) {
+   do { stop(signal); await check(); if (await test()) return true; if (Date.now() >= deadline) break; await waitForCommentTick(75, undefined, { signal }); } while (Date.now() < deadline);
+   return false;
+ }
+-async function prepareCommentPointer(page, locator, { check, signal, expectedVideoId, mode, expectedDraft, nativeIcon = false, scope: scopeLocator = locator }) {
++async function prepareCommentPointer(page, locator, { check, signal, expectedVideoId, mode, expectedDraft, nativeIcon = false, scope: scopeLocator = locator, random = Math.random }) {
+   stop(signal); await check();
+   if (await locator.count() !== 1) throw new Error('评论输入目标不唯一，未输入。');
+   const currentSelf = await page.evaluate(readCommentSelfIdentity);
+@@ -114,7 +117,7 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
+       let draftElement = null;
+       if (input.mode === 'editor') draftElement = element;
+       if (input.mode === 'submit') { const editors = editorsInScope(); if (editors.length === 1) draftElement = editors[0]; else { element.removeAttribute('data-deepseek-comment-pointer'); return false; } }
+-      const clean = value => String(value ?? '').replace(/[\u200B-\u200F\uFEFF]/g, '').trim();
++      const clean = value => String(value ?? '').replace(/[\u200B-\u200F\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+       const entry = { element, scope, mode: input.mode, draftElement, dispatched: false, blocked: false, armed: false, armedAt: null, point: null, pointerStarted: false };
+       const videoMatches = () => {
+         const route = new URL(location.href), routeId = /^\/video\/(\d+)\/?$/.exec(route.pathname)?.[1] || route.searchParams.get('modal_id') || route.searchParams.get('aweme_id');
+@@ -144,8 +147,7 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
+         if ([...document.querySelectorAll('[data-e2e="im-dialog"],#captcha_container,[id^="captcha_container"],[data-e2e="captcha-container"]')].some(visible)) return null;
+         if ([...document.querySelectorAll('body *')].some(node => !node.childElementCount && visible(node) && !node.closest(privateArea) && /扫码登录|验证码登录|登录后即可|手机扫码登录|请完成下方验证|请完成验证|安全验证|拖动滑块/.test(node.textContent || ''))) return null;
+         const self = readSelf(); if (!self.ready || self.ownProfileId !== input.ownProfileId) return null;
+-        if (draftElement && (!draftElement.isConnected || clean(draftElement instanceof HTMLInputElement || draftElement instanceof HTMLTextAreaElement ? draftElement.value : draftElement.innerText) !== input.expectedDraft || draftElement.querySelector('img,video,audio,a,[data-slate-void="true"]'))) return null;
+-        const r = element.getBoundingClientRect(), rawX = input.mode === 'submit' ? r.x + r.width / 2 : r.x + Math.min(16, r.width / 2), rawY = r.y + r.height / 2;
++        if (draftElement && (!draftElement.isConnected || clean(draftElement instanceof HTMLInputElement || draftElement instanceof HTMLTextAreaElement ? draftElement.value : draftElement.innerText) !== input.expectedDraft || draftElement.querySelector('img,video,audio,a,[data-slate-void="true"]'))) return null;        const r = element.getBoundingClientRect(), rawX = input.mode === 'submit' ? r.x + r.width / 2 : r.x + Math.min(16, r.width / 2), rawY = r.y + r.height / 2;
+         const x = heldPoint && input.mode !== 'submit' ? heldPoint.clickX : Math.round(rawX), y = heldPoint && input.mode !== 'submit' ? heldPoint.clickY : Math.round(rawY);
+         if (r.width < 2 || r.height < 2 || !Number.isSafeInteger(x) || !Number.isSafeInteger(y) || x < r.left || y < r.top || x >= r.right || y >= r.bottom || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;
+         const hit = document.elementFromPoint(x, y);
+@@ -169,7 +171,7 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
+       element.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+       return true;
+     }, { token, mode, expectedVideoId, expectedDraft, ownProfileId: currentSelf.ownProfileId, icon: nativeIcon ? NATIVE_PUBLISH_ICON : null });
+-    if (!installed) throw new Error('评论输入几何见证未安装，未输入。');
++    if (!installed) throw Object.assign(new Error('评论输入几何见证未安装，未输入。'), { needsUserAction: true });
+     const readPoint = () => page.evaluate(token => window.__deepseekCommentGeometryInputs?.[token]?.readPoint() || null, token);
+     let previous, stablePoint, stableSamples = 0;
+     const deadline = Date.now() + 3000;
+@@ -184,7 +186,7 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
+       stop(signal); await check(); const point = await readPoint(); if (!sameCommentPoint(point, stablePoint)) throw new Error('最终评论输入前几何、身份、草稿或遮挡已变化，未点击。');
+       const armed = await page.evaluate(({ token, point }) => { const entry = window.__deepseekCommentGeometryInputs?.[token]; if (!entry || !entry.readPoint()) return false; entry.point = point; entry.armed = true; entry.armedAt = Date.now(); return true; }, { token, point });
+       if (!armed) throw new Error('评论输入事件门禁未就绪，未点击。');
+-      stop(signal); attempted = true; await page.mouse.click(point.clickX, point.clickY);
++      stop(signal); attempted = true; await humanClick(page, { x: point.clickX, y: point.clickY }, { random, signal });
+       const receipt = await page.evaluate(token => { const entry = window.__deepseekCommentGeometryInputs?.[token]; return { dispatched: entry?.dispatched === true, blocked: entry?.blocked === true }; }, token);
+       if (!receipt.dispatched || receipt.blocked) throw new Error('评论输入没有可信事件见证或被最终门禁拦截，未重复点击。');
+     } };
+@@ -213,8 +215,7 @@ async function activateCommentEditor(page, expectedVideoId, check, signal) {
+   const bounds = await lazy.boundingBox();
+   if (!bounds || bounds.width < 8 || bounds.height < 8) return editors;
+   // 只激活已核对的空评论输入区域，不点击发布或使用回车提交。
+-  const activation = await prepareCommentPointer(page, lazy, { check, signal, expectedVideoId, mode: 'lazy' });
+-  try { await activation.click(); } finally { await activation.close(); }
++  const activation = await prepareCommentPointer(page, lazy, { check, signal, expectedVideoId, mode: 'lazy' });  try { await activation.click(); } finally { await activation.close(); }
+   await waitCommentState(() => page.evaluate(() => [...document.querySelectorAll('.comment-input-inner-container [contenteditable="true"],.comment-input-inner-container textarea')].some(element => { const r = element.getBoundingClientRect(); return r.width > 0 && r.height > 0 && !element.closest('[data-e2e="im-dialog"],[data-e2e="conversation-item"],[data-e2e="comment-item"],[data-e2e="danmaku-container"]'); })), check, signal, 1500);
+   await check();
+   editors = page.locator(EDITORS).filter({ visible: true });
+@@ -401,12 +402,14 @@ function assertVideo(state, expectedVideoId) {
+ }
+ 
+ export class CommentBrowser {
+-  constructor({ source = 'api', controller, videoLimits, stateDir = resolveRuntimePaths().stateDir } = {}) {
++  constructor({ source = 'api', controller, videoLimits, stateDir = resolveRuntimePaths().stateDir, random } = {}) {
+     if (!['api', 'dsh'].includes(source)) throw new TypeError('评论入口只能是 api 或 dsh。');
+     this.source = source; this.stateDir = stateDir;
+     this.videoLimits = videoLimits ?? new VideoLimits({ stateDir });
+     // 默认创建独立的同入口控制器，不能复用正在等待评论结果的父控制器队列。
+     this.controller = controller ?? new BrowserController({ source, videoLimits: this.videoLimits }); this.ownsController = !controller;
++    // 输入节奏的随机源可注入，测试里固定种子即可复现。
++    this.random = random ?? createRandom();
+     this.receiptsFile = path.join(stateDir, 'comment-browser-receipts.json'); this.guardFile = path.join(stateDir, 'comment-post.guard');
+   }
+   receipts() { try { const value = JSON.parse(fs.readFileSync(this.receiptsFile, 'utf8')); if (!value || value.version !== 1 || !Array.isArray(value.operations) || value.operations.some(item => !item || typeof item.operationId !== 'string' || !/^\d{1,64}$/.test(item.videoId) || !['clicking', 'confirmed', 'uncertain'].includes(item.status) || item.baseline && !checkReceiptBaseline(item, 'public-comment').available)) throw Error(); return value; } catch (error) { if (error.code === 'ENOENT') return { version: 1, operations: [] }; throw new Error('原评论发布收据无法核对，未自动重发。'); } }
+@@ -415,7 +418,7 @@ export class CommentBrowser {
+   async gate(signal) { stop(signal); const state = this.videoLimits.state(); if (!state.allowed) throw new Error(state.reason || '有限观看时段已结束，未发布评论。'); }
+   async post({ expectedVideoId, text, ...extra } = {}, { signal: parentSignal, authorize, autonomousRunId } = {}) {
+     if (typeof expectedVideoId !== 'string' || !/^\d{1,64}$/.test(expectedVideoId) || Object.keys(extra).length) throw new TypeError('评论只能指定当前作品编号与纯文字。');
+-    text = validateCommentText(text);
++    text = prepareCommentText(text);
+     if (typeof authorize !== 'function' || typeof authorize.beginDispatch !== 'function') return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '评论缺少可信本机许可与最终短输入控制，未发布。' };
+     const interrupt = new AbortController(), signal = AbortSignal.any([interrupt.signal, ...(parentSignal ? [parentSignal] : [])]);
+     const authorized = async phase => { stop(signal); if (await authorize({ phase, videoId: expectedVideoId }) !== true) throw new Error('自主评论许可已撤回，未继续发布。'); stop(signal); };
+@@ -433,7 +436,14 @@ export class CommentBrowser {
+         };
+         const checkPage = async () => { await authorized('monitor'); await this.gate(signal); assertVideo(await page.evaluate(readPageState), expectedVideoId); await checkSelf(); };
+         await checkPage();
+-        const editors = await activateCommentEditor(page, expectedVideoId, checkPage, signal);
++        // 评论面板可能是刚展开的：先等输入框稳定，避免展开动画中途就判定「没有输入框」。
++        let editors;
++        for (let attempt = 0; ; attempt++) {
++          editors = await activateCommentEditor(page, expectedVideoId, checkPage, signal);
++          if (await editors.count() === 1 || attempt >= EDITOR_WAIT_RETRIES) break;
++          await waitForCommentTick(EDITOR_WAIT_BACKOFF * (attempt + 1), undefined, { signal });
++          await checkPage();
++        }
+         if (await editors.count() !== 1) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, needsUserAction: true, reason: '当前页面没有唯一可核对的评论输入框，需要先打开评论面板或等待适配。' };
+         const editor = editors;
+         const initial = await findCommentSubmit(editor, expectedVideoId);
+@@ -453,7 +463,9 @@ export class CommentBrowser {
+         const check = async () => {
+           if (clicked && await inputDispatched()) return;
+           await checkPage();
+-          if (await editors.count() !== 1 || !await composerScopeValid(root, expectedVideoId) || prepared && cleanDraft(await draft()) !== text || await hasFile() || await root.locator('[data-e2e="comment-reply-target"],.PPsJmqBy').filter({ visible: true }).count()) throw new Error('等待期间评论输入、发布目标或草稿发生变化，未发布。');
++          // DraftEditor 会在正文前后插入 ZWSP 并可能合并空白，比较时统一归一化，
++          // 这样「我们写的内容还在」与「用户改过草稿」仍然能可靠区分。
++          if (await editors.count() !== 1 || !await composerScopeValid(root, expectedVideoId) || prepared && normalizeDraft(await draft()) !== normalizeDraft(text) || await hasFile() || await root.locator('[data-e2e="comment-reply-target"],.PPsJmqBy').filter({ visible: true }).count()) throw new Error('等待期间评论输入、发布目标或草稿发生变化，未发布。');
+           if (send) {
+             const latest = await findCommentSubmit(editor, expectedVideoId);
+             if (await send.count() !== 1 || !latest.send || await latest.send.getAttribute('data-deepseek-comment-control') !== witnessId) throw new Error('等待期间评论发布控件发生变化或出现歧义，未发布。');
+@@ -463,11 +475,16 @@ export class CommentBrowser {
+         const timer = setInterval(() => { if (!monitoring || polling) return; polling = check().catch(async error => { if (monitoring && !await inputDispatched().catch(() => false)) interrupt.abort(error); }).finally(() => { polling = null; }); }, 40);
+         try {
+           await check();
+-          const focus = await prepareCommentPointer(page, editor, { check, signal, expectedVideoId, mode: 'editor', expectedDraft: '', scope: root });
++          const focus = await prepareCommentPointer(page, editor, { check, signal, expectedVideoId, mode: 'editor', expectedDraft: '', scope: root, random: this.random });
+           try { await focus.click(); } finally { await focus.close(); }
+           stop(signal);
+-          // 使用浏览器真实文字输入触发受控编辑器；填写与页面回读一致后才等待发布按钮。
+-          await editor.pressSequentially(text, { delay: 10 }); stop(signal); prepared = true; await check();
++          // 用带节奏抖动的真实键盘输入；被吞字时只补缺失内容，绝不重填覆盖。
++          await typeHumanly(page, text, { random: this.random, signal });
++          stop(signal);
++          if (!await ensureEditorText(page, editor, text, { random: this.random, signal })) {
++            throw Object.assign(new Error('评论输入框回读与待发文字不一致，草稿已保留，未发布。'), { needsUserAction: true });
++          }
++          prepared = true; await check();
+           const selected = await findCommentSubmit(editor, expectedVideoId);
+           if (!selected.send) throw Object.assign(new Error(selected.ambiguous ? '当前评论区域存在多个发布控件，草稿已保留，未发布。' : '当前评论输入已激活，但没有唯一可核对的发布控件；草稿已保留，需要适配当前抖音页面。'), { needsUserAction: true });
+           root = selected.root;
+@@ -477,7 +494,7 @@ export class CommentBrowser {
+           await check();
+           const enabled = await waitCommentState(() => page.evaluate(token => { const element = [...document.querySelectorAll('[data-deepseek-comment-control]')].find(item => item.getAttribute('data-deepseek-comment-control') === token); return Boolean(element && !element.closest(':disabled,[aria-disabled="true"],[data-disabled="true"],.disabled') && (element.getAttribute('data-deepseek-comment-native-publish') !== token || element.classList.contains('jfGCpJo0'))); }, witnessId), check, signal, 3000);
+           if (!enabled) throw Object.assign(new Error('评论发布控件尚不可用，草稿已保留，未点击。'), { needsUserAction: true });
+-          submitPointer = await prepareCommentPointer(page, send, { check, signal, expectedVideoId, mode: 'submit', expectedDraft: text, nativeIcon: selected.nativeIcon, scope: root });
++          submitPointer = await prepareCommentPointer(page, send, { check, signal, expectedVideoId, mode: 'submit', expectedDraft: text, nativeIcon: selected.nativeIcon, scope: root, random: this.random });
+           stop(signal); await check();
+           if (await inputDispatched()) { dispatched = true; throw new Error('等待期间已发生发布输入，未再点击一次。'); }
+           await authorized('before-click'); releaseDispatch = await authorize.beginDispatch(); if (typeof releaseDispatch !== 'function') throw new Error('最终评论输入未取得可释放的本机许可。');
+diff --git a/comment-text.mjs b/comment-text.mjs
+new file mode 100644
+index 0000000..c1f4332
+--- /dev/null
++++ b/comment-text.mjs
+@@ -0,0 +1,61 @@
++// 公开评论文字：先修复不可见字符、换行与@提及，再核对真正不能公开的内容边界。
++// 修复只做「不改变语义的机械清理」，联系方式、链接、凭据仍整条拒绝，由上层跳过而不是中断观看。
++const fail = (message, status = 400) => Object.assign(new Error(message), { status });
++
++export const COMMENT_TEXT_LIMIT = 200;
++// 控制符、零宽字符、双向覆盖符、BOM、行分隔符、私用区：在编辑器里会吞字或被判为异常输入。
++const INVISIBLE = /[\u0000-\u001F\u007F-\u009F\u00AD\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/g;
++const PRIVATE_USE = /[\uE000-\uF8FF]/g;
++const SPACES = /[ \t\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]+/g;
++const MENTION = /[@＠]\s*[\p{L}\p{N}_.\-·]{1,30}/gu;
++const STRAY_MENTION = /[@＠]+/gu;
++// 邮箱形状的@不是「提及」，不能靠剥离绕过检查，原样保留交给边界校验拒绝。
++const EMAIL_LIKE = /[a-z0-9._%+-]+\s*[@＠]\s*[a-z0-9-]+(?:\.[a-z0-9-]+)+/i;
++const SENTENCE = /[。！？!?…；;]/u;
++
++// 只拒绝真正不能公开的内容；「账号」「好友」「联系人」等普通词不再误杀。
++const BLOCKED = /[@＠]|https?:|www\.|(?:[a-z0-9-]+\.)+(?:com|cn|net|org|io|dev|app|me|top|xyz|co|tv)\b|(?:\d[\s-]*){7,}|sk[-_][a-z0-9_-]{6,}|api[\s_-]*key|token|cookie|password|密钥|口令|验证码|身份证|手机号|手机号码|私聊|私信|微信|QQ|加我/iu;
++const PROMISE = /(?:我|我们|大肥鱼).{0,8}(?:保证|承诺|负责|一定(?:会|帮|给|送)|会(?:联系|见面|到场|付款|购买|送|转账|打钱|帮你))|(?:我|我们).{0,6}(?:亲自|实测|用过|去过|见过|买过|吃过|听完|看完)/u;
++
++export function graphemeClusters(text) {
++  const value = String(text ?? '');
++  try { return [...new Intl.Segmenter('zh-Hans', { granularity: 'grapheme' }).segment(value)].map(item => item.segment); }
++  catch { return Array.from(value); }
++}
++
++function clip(text, limit = COMMENT_TEXT_LIMIT) {
++  const clusters = graphemeClusters(text);
++  if (clusters.length <= limit) return text;
++  // 超长时尽量在整句处截断，避免半个字或半个表情。
++  const head = clusters.slice(0, limit).join('');
++  for (let index = head.length - 1; index >= Math.floor(head.length * 0.6); index--) {
++    if (SENTENCE.test(head[index])) return head.slice(0, index + 1);
++  }
++  return head.replace(/[\s，,、,；;：:·]+$/u, '');
++}
++
++// 机械修复：不可见字符、换行、@提及、异常空白与超长；不改写正文用词。
++export function sanitizeCommentText(value) {
++  if (typeof value !== 'string') throw fail('评论须为 1 至 200 字的单段纯文字。');
++  // 先把换行/制表变成空格，再剔除其余控制符，避免两行文字粘成一行。
++  let text = value.replace(/\r\n?/g, '\n').replace(/[\n\t]+/g, ' ');
++  text = text.replace(INVISIBLE, '').replace(PRIVATE_USE, '');
++  // 邮箱一类的联系方式不剥离，原样保留，交给边界校验整条拒绝。
++  const protectedEmail = EMAIL_LIKE.test(text);
++  if (!protectedEmail) text = text.replace(MENTION, ' ').replace(STRAY_MENTION, ' ');
++  text = text.replace(SPACES, ' ').trim();
++  text = clip(text).replace(SPACES, ' ').trim();
++  if (!text) throw fail('评论在清除非公开内容后为空，未发布。');
++  return text;
++}
++
++export function validateCommentText(value) {
++  if (typeof value !== 'string' || !value.trim() || [...value.trim()].length > COMMENT_TEXT_LIMIT || /[\x00-\x1f\x7f\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/.test(value)) throw fail('评论须为 1 至 200 字的单段纯文字。');
++  const text = value.trim(), folded = text.normalize('NFKC');
++  if (BLOCKED.test(folded)) throw fail('公开评论不能包含@、链接、联系方式、密钥或私人聊天与好友信息。', 400);
++  if (PROMISE.test(folded)) throw fail('评论只能谈当前有限观察，不能编造现实经历或作现实承诺。', 400);
++  return text;
++}
++
++// 发布前唯一入口：先修复可修复的特殊字符，再按公开边界核对。
++export function prepareCommentText(value) { return validateCommentText(sanitizeCommentText(value)); }
+diff --git a/core.mjs b/core.mjs
+index f99808d..4eba253 100644
+--- a/core.mjs
++++ b/core.mjs
+@@ -13,6 +13,7 @@ import { BrowserLauncher, connectDedicatedBrowser } from './browser-launcher.mjs
+ import { pauseExistingVideoPages } from './browser-pause.mjs';
+ import { browserPageLabel, browserPageLock, findSharedPage, adoptSharedPreparePage } from './browser-pages.mjs';
+ import { StoryboardFrameStore } from './video-storyboard.mjs';
++import { humanClick, moveHuman } from './human-input.mjs';
+ 
+ const ROOT = path.dirname(fileURLToPath(import.meta.url));
+ const SHARED_CAPTURE_MODE = Symbol('shared-video-frame-capture');
+@@ -979,11 +980,15 @@ export class BrowserController {
+       aborted(signal);
+       const armInput=()=>this.page.evaluate(currentToken=>{const entry=window.__deepseekVideoSwitchInputs?.[currentToken];if(!entry)return false;entry.armed=true;entry.timer=setTimeout(()=>{entry.expired=true;},1500);return true;},token);
+       if(control){
++        // 轨迹先走完再武装事件门禁：见证只有1.5秒，不能被鼠标移动占用。
++        await moveHuman(this.page,{x:finalPoint.clickX,y:finalPoint.clickY});
++        if(!await checkPendingInput())return inputDenied;
++        const hoverPoint=await readPoint();if(!sameGeometry(finalPoint,hoverPoint))return denied(before,'switch-control-changed');
+         if(!await armInput())return denied(before,'switch-control-changed');
+         aborted(signal);
+-        await this.page.mouse.click(finalPoint.clickX,finalPoint.clickY);
++        await this.page.mouse.click(finalPoint.clickX,finalPoint.clickY,{delay:60+Math.round(Math.random()*40)});
+       }else{
+-        await this.page.mouse.move(finalPoint.clickX,finalPoint.clickY);
++        await moveHuman(this.page,{x:finalPoint.clickX,y:finalPoint.clickY});
+         if(!await checkPendingInput())return inputDenied;
+         const wheelPoint=await readPoint();if(!sameGeometry(finalPoint,wheelPoint))return denied(before,'switch-control-changed');
+         if(!await armInput())return denied(before,'switch-control-changed');
+diff --git a/human-input.mjs b/human-input.mjs
+new file mode 100644
+index 0000000..084e56d
+--- /dev/null
++++ b/human-input.mjs
+@@ -0,0 +1,120 @@
++// 类人输入：把「瞬间瞬移 + 固定 10ms 打字」改成有轨迹、有节奏抖动、有单词停顿的输入。
++// 只影响输入节奏与鼠标轨迹，不改动任何授权、几何见证、收据或去重规则。
++import { createHash } from 'node:crypto';
++
++const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
++// 所有随机取值都必须走同一个随机源，否则固定种子也无法复现。
++const between = (min, max, random = Math.random) => min + random() * (max - min);
++// 可复现的随机源，测试里固定种子即可得到稳定节奏。
++export function createRandom(seed) {
++  if (seed === undefined || seed === null) return Math.random;
++  // 种子先散列成 32 位整数，再跑 xorshift32；同一个种子永远得到同一串节奏。
++  const digest = createHash('sha256').update(String(seed)).digest();
++  let state = (digest.readUInt32LE(0) || 1) >>> 0;
++  return () => {
++    state ^= state << 13; state >>>= 0;
++    state ^= state >>> 17;
++    state ^= state << 5; state >>>= 0;
++    return state / 0x1_0000_0000;
++  };
++}
++
++// 中文/全角字符按「逐字」节奏，拉丁字母与数字按「词内较快」，标点后停顿更久。
++export function typingDelay(character, random = Math.random) {
++  const base = /[\u3000-\u9FFF\uFF00-\uFFEF]/u.test(character) ? between(95, 210, random)
++    : /[a-zA-Z0-9]/u.test(character) ? between(55, 125, random)
++    : between(70, 160, random);
++  const pause = /[，,。.！!？?；;：:、…]/u.test(character) ? between(140, 420, random)
++    : /[\s]/u.test(character) ? between(60, 180, random) : 0;
++  // 偶发的思考停顿，让整段节奏不像固定采样。
++  const hiccup = random() < 0.06 ? between(240, 700, random) : 0;
++  return Math.round(clamp(base + pause + hiccup, 25, 1200));
++}
++
++function stepsFor(distance, random) {
++  const step = clamp(Math.round(distance / between(45, 90, random)), 8, 60);
++  return step + Math.round(between(0, 6, random));
++}
++
++// 贝塞尔近似的人手轨迹：轻微过冲 + 末段减速，避免一条直线和零加速度。
++export function humanePath(from, to, random = Math.random) {
++  const distance = Math.hypot(to.x - from.x, to.y - from.y);
++  if (distance < 2) return [{ x: to.x, y: to.y, delay: Math.round(between(20, 60, random)) }];
++  const steps = stepsFor(distance, random);
++  const curveX = between(-0.22, 0.22, random) * distance, curveY = between(-0.22, 0.22, random) * distance;
++  const mid = (t) => {
++    const control = { x: (from.x + to.x) / 2 + curveX, y: (from.y + to.y) / 2 + curveY };
++    const inverse = 1 - t;
++    return { x: inverse * inverse * from.x + 2 * inverse * t * control.x + t * t * to.x, y: inverse * inverse * from.y + 2 * inverse * t * control.y + t * t * to.y };
++  };
++  const path = [];
++  for (let index = 1; index <= steps; index++) {
++    const raw = index / steps, eased = 1 - Math.pow(1 - raw, 2.6);
++    const point = mid(eased);
++    const jitterScale = (1 - eased) * 0.8 + 0.2;
++    path.push({ x: point.x + between(-1.1, 1.1, random) * jitterScale, y: point.y + between(-1.1, 1.1, random) * jitterScale, delay: Math.round(between(9, 26, random) / (0.6 + eased)) });
++  }
++  path.push({ x: to.x, y: to.y, delay: Math.round(between(30, 90, random)) });
++  return path;
++}
++
++// 让鼠标沿人手轨迹移到目标（不点击），用于滚轮换片这类本来就不是点击的输入。
++export async function moveHuman(page, point, { random = Math.random, signal } = {}) {
++  signal?.throwIfAborted();
++  // 合成页面可能没有鼠标接口；此时退化为不移动，点击本身仍由调用方完成。
++  if (typeof page?.mouse?.move !== 'function') return;
++  const origin = page.__deepseekLastPointer;
++  const from = origin && Number.isFinite(origin.x) ? origin : { x: point.x + between(-90, 90, random), y: point.y + between(-70, 70, random) };
++  for (const step of humanePath(from, point, random)) {
++    signal?.throwIfAborted();
++    await page.mouse.move(step.x, step.y);
++    await new Promise(resolve => setTimeout(resolve, step.delay));
++  }
++  page.__deepseekLastPointer = { x: point.x, y: point.y };
++}
++
++// 真实点击：先按人手轨迹移入，再用一次真实 click 完成按下与抬起，不额外产生事件。
++export async function humanClick(page, point, { random = Math.random, signal } = {}) {
++  await moveHuman(page, point, { random, signal });
++  signal?.throwIfAborted();
++  // 轨迹已经把人手停在目标上；这里用单次 click（含短按下时长），仍只有一个点击事件。
++  await page.mouse.click(point.x, point.y, { delay: Math.round(between(35, 95, random)) });
++  page.__deepseekLastPointer = { x: point.x, y: point.y };
++}
++
++export async function typeHumanly(page, text, { random = Math.random, signal, onCharacter } = {}) {
++  const characters = Array.from(text);
++  for (const [index, character] of characters.entries()) {
++    signal?.throwIfAborted();
++    await page.keyboard.type(character);
++    await onCharacter?.(character, index);
++    await new Promise(resolve => setTimeout(resolve, typingDelay(character, random)));
++  }
++}
++
++// 受控编辑器（DraftEditor 等）会丢字，也可能把输入法组合事件当异常；这里只做「补齐」不做覆盖。
++export async function readEditorText(locator) {
++  return locator.evaluate(element => element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value : element.innerText);
++}
++
++export function normalizeDraft(value) { return String(value ?? '').replace(/[\u200B-\u200F\uFEFF]/g, '').replace(/\s+/g, ' ').trim(); }
++
++// 输入可能被吞字或重排：只补缺失的后缀，绝不整体重填（重填会覆盖用户内容）。
++export async function ensureEditorText(page, locator, text, { random = Math.random, signal, attempts = 3 } = {}) {
++  const expected = normalizeDraft(text);
++  let current = normalizeDraft(await readEditorText(locator));
++  if (current === expected) return true;
++  for (let attempt = 0; attempt < attempts; attempt++) {
++    signal?.throwIfAborted();
++    // 编辑器里已有别的内容就不是「吞字」，交给上层保留原草稿并中止。
++    const remaining = expected.startsWith(current) ? expected.slice(current.length)
++      : current && expected.includes(current) ? expected.replace(current, '')
++      : null;
++    if (remaining === null) return false;
++    if (!remaining) { current = normalizeDraft(await readEditorText(locator)); continue; }
++    await typeHumanly(page, remaining, { random, signal });
++    current = normalizeDraft(await readEditorText(locator));
++    if (current === expected) return true;
++  }
++  return current === expected;
++}
+diff --git a/package.json b/package.json
+index ec38370..efce97d 100644
+--- a/package.json
++++ b/package.json
+@@ -66,8 +66,10 @@
+     "friend-interactions.mjs",
+     "friend-interactions-guard.mjs",
+     "group-reply-trigger.mjs",
++    "human-input.mjs",
+     "client.js",
+     "comment-browser.mjs",
++    "comment-text.mjs",
+     "cordis.bundle.yml",
+     "core.mjs",
+     "daily-report.mjs",
+diff --git a/public-comment-agent.mjs b/public-comment-agent.mjs
+index b010cd0..a44f1c9 100644
+--- a/public-comment-agent.mjs
++++ b/public-comment-agent.mjs
+@@ -1,6 +1,6 @@
+ import { watchDecisionMessages } from './api-agent.mjs?v=9';
+ import { videoImageParts } from './video-storyboard.mjs';
+-import { validateCommentText } from './autonomous-comments.mjs?v=9';
++import { prepareCommentText } from './comment-text.mjs';
+ 
+ export const PUBLIC_COMMENT_PROMPT = `你是大肥鱼，一个 AI 助手。只根据本次抖音作品的实际采样画面、标题和作者，生成一条简短、有具体内容的公开评论；没有足够内容可说就放弃。
+ 输出一个 JSON 对象，格式 {"text":"评论正文"}，放弃时 {"text":null}。最多200字，不输出工具调用或其他字段。不要假装看完整条或听到声音，不编造经历、关系和事实，不冒充用户或真人。不要输出@、链接、个人资料、私信内容、凭据或现实承诺。
+@@ -39,7 +39,7 @@ export class PublicCommentAgent {
+       let value; try { value = JSON.parse(result.text); } catch { throw new Error('评论模型没有返回有效JSON。'); }
+       if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1 || !Object.hasOwn(value, 'text')) throw new Error('评论模型返回了未允许字段。');
+       if (value.text !== null && this.config.apiKey && String(value.text).includes(this.config.apiKey)) throw new Error('评论包含凭据，未发布。');
+-      return { text: value.text === null ? null : validateCommentText(value.text), usage: result.usage || {} };
++      return { text: value.text === null ? null : prepareCommentText(value.text), usage: result.usage || {} };
+     } finally { actualSignal.removeEventListener('abort', abortHandler); }
+   }
+ }
+diff --git a/tests/autonomous-comments.test.mjs b/tests/autonomous-comments.test.mjs
+index 11cc0ce..cb1dbfa 100644
+--- a/tests/autonomous-comments.test.mjs
++++ b/tests/autonomous-comments.test.mjs
+@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
+ import fs from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
+-import { AutonomousComments, validateCommentText } from '../autonomous-comments.mjs';
++import { AutonomousComments, validateCommentText, prepareCommentText, sanitizeCommentText } from '../autonomous-comments.mjs';
+ import { PersonaMemory } from '../persona-memory.mjs';
+ import { VideoLimits } from '../video-limits.mjs';
+ 
+@@ -32,8 +32,29 @@ test('评论默认关闭且模型不能改许可；次数只接受有限整数',
+ });
+ test('公开评论只接受短纯文字，拒绝@、URL、号码、Key、私聊信息和现实承诺', () => {
+   assert.equal(validateCommentText('  光影看着很舒服。  '), '光影看着很舒服。'); assert.equal(validateCommentText('鱼'.repeat(200)).length, 200);
+-  for (const text of ['', '鱼'.repeat(201), '第一行\n第二行', '隐\u200b藏', '@朋友', '＠朋友', 'https://example.com/a', '看example.com', '电话13800138000', 'sk-abcdefghijklmnopqrstuvwxyz', 'API Key是abc', 'QQ12345', '微信聊', '好友也喜欢', '我保证帮你', '我会联系你', '我亲自去过这里']) assert.throws(() => validateCommentText(text), undefined, text);
++  for (const text of ['', '鱼'.repeat(201), '第一行\n第二行', '隐\u200b藏', '@朋友', '＠朋友', 'https://example.com/a', '看example.com', '电话13800138000', 'sk-abcdefghijklmnopqrstuvwxyz', 'API Key是abc', 'QQ12345', '微信聊', '加我私聊', '我保证帮你', '我会联系你', '我亲自去过这里']) assert.throws(() => validateCommentText(text), undefined, text);
++  // 「账号」「好友」「联系人」本身是普通词，不再误杀；真正的联系人泄露由 privateContent 按白名单拦截。
++  for (const text of ['这个账号的剪辑节奏很好', '说给好友听也合适', '联系人这个词只是普通说法']) assert.equal(validateCommentText(text), text);
+ });
++test('特殊字符先自动修复再核对：不可见字符、换行、@提及、异常空白和超长都能正常发出', () => {
++  assert.equal(prepareCommentText('  光影看着很舒服。  '), '光影看着很舒服。');
++  assert.equal(prepareCommentText('光影\u200b看着很\ufeff舒服。'), '光影看着很舒服。');
++  assert.equal(prepareCommentText('第一行\n第二行'), '第一行 第二行');
++  assert.equal(prepareCommentText('光影\t\t看着   很舒服。'), '光影 看着 很舒服。');
++  assert.equal(prepareCommentText('@罗根-算法专家 这段讲得清楚。'), '这段讲得清楚。');
++  assert.equal(prepareCommentText('讲得清楚。＠某人'), '讲得清楚。');
++  assert.equal(prepareCommentText('这个账号的自动发布思路可以。'), '这个账号的自动发布思路可以。');
++  assert.equal(prepareCommentText('好看😀😀').length > 0, true);
++  const long = prepareCommentText('鱼'.repeat(500)); assert.ok([...long].length <= 200);
++  const sentences = prepareCommentText('这段话很好。'.repeat(60)); assert.ok([...sentences].length <= 200); assert.ok(sentences.endsWith('。'));
++  // 表情集群不被截成半个字符
++  const emoji = [...prepareCommentText('好看😀'.repeat(100))];
++  assert.equal(emoji[emoji.length - 1] === '\u200d', false);
++  assert.equal(sanitizeCommentText('  a  b  '), 'a b');
++  // 修不掉的仍然拒绝，交给观看循环记为跳过
++  for (const text of ['看example.com', '电话13800138000', 'QQ12345', '邮箱 a@b.com', '@']) assert.throws(() => prepareCommentText(text), undefined, text);
++});
++
+ test('没有同源当前自主观看与有限轮次，或已请求停止时不能评论', async t => {
+   const f = fixture(t); f.service.configure({ enabled: true }, { explicit: true }); const input = f.evidence();
+   await assert.rejects(f.service.comment(input), /自主观看/); await assert.rejects(f.service.comment(input, { watchRunId: 'wrong' }), /自主观看/);
+diff --git a/tests/human-input.test.mjs b/tests/human-input.test.mjs
+new file mode 100644
+index 0000000..c0ebc07
+--- /dev/null
++++ b/tests/human-input.test.mjs
+@@ -0,0 +1,45 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { createRandom, typingDelay, humanePath, normalizeDraft } from '../human-input.mjs';
++
++test('类人输入：打字节奏有抖动、标点后停顿更久，不是固定10毫秒', () => {
++  const random = createRandom('typing-seed'), source = '这段剪辑的节奏很好，配色也舒服。', delays = [];
++  for (const character of source) delays.push(typingDelay(character, random));
++  assert.equal(delays.length, Array.from(source).length);
++  assert.ok(Math.min(...delays) >= 25); assert.ok(Math.max(...delays) <= 1200);
++  // 不应退化成一个常数节奏
++  assert.ok(new Set(delays).size > 8, '打字间隔必须离散');
++  assert.ok(Math.max(...delays) - Math.min(...delays) >= 40);
++  // 标点后的停顿应长于普通汉字
++  const random2 = createRandom('punctuation-seed');
++  const letters = Array.from({ length: 40 }, () => typingDelay('好', random2));
++  const marks = Array.from({ length: 40 }, () => typingDelay('。', random2));
++  const mean = values => values.reduce((sum, value) => sum + value, 0) / values.length;
++  assert.ok(mean(marks) > mean(letters));
++});
++
++test('类人输入：鼠标轨迹是连续多段带加速度的曲线，而不是一次瞬移', () => {
++  const path = humanePath({ x: 10, y: 10 }, { x: 400, y: 260 }, createRandom('path-seed'));
++  assert.ok(path.length >= 9, '必须有足够中间点');
++  assert.deepEqual({ x: path.at(-1).x, y: path.at(-1).y }, { x: 400, y: 260 });
++  assert.ok(path.every(step => Number.isFinite(step.x) && Number.isFinite(step.y) && step.delay > 0));
++  // 相邻点间距受限，不会出现跨越整屏的瞬移
++  for (let index = 1; index < path.length; index++) assert.ok(Math.hypot(path[index].x - path[index - 1].x, path[index].y - path[index - 1].y) <= 140);
++  // 轨迹不应是一条直线：中途存在偏离直线连接的采样点
++  const deviation = path.slice(1, -1).some(step => Math.abs((step.x - 10) * 250 - (step.y - 10) * 390) > 200);
++  assert.equal(deviation, true);
++  // 起止点重合时只返回一个落点，不产生空轨迹
++  assert.deepEqual(humanePath({ x: 5, y: 5 }, { x: 5, y: 5 }, createRandom()).length, 1);
++});
++
++test('类人输入：草稿回读只归一化不可见字符与空白，不改写正文', () => {
++  assert.equal(normalizeDraft('\u200b光影 很舒服。'), '光影 很舒服。');
++  assert.equal(normalizeDraft('  a\n b  '), 'a b');
++  assert.equal(normalizeDraft('这个账号的节奏好'), '这个账号的节奏好');
++});
++
++test('类人输入：同一随机种子可复现，不同种子产生不同节奏', () => {
++  const build = seed => { const random = createRandom(seed); return Array.from({ length: 12 }, () => typingDelay('好', random)); };
++  assert.deepEqual(build('seed-a'), build('seed-a'));
++  assert.notDeepEqual(build('seed-a'), build('seed-b'));
++});
+diff --git a/tests/watch-comment-flow.test.mjs b/tests/watch-comment-flow.test.mjs
+index a0ee388..85a3343 100644
+--- a/tests/watch-comment-flow.test.mjs
++++ b/tests/watch-comment-flow.test.mjs
+@@ -59,6 +59,40 @@ test('未确认公开评论立即停止watch并保留核对状态，没有第二
+   assert.equal(f.watch.state().status, 'needs_user'); assert.equal(f.watch.state().counts.requests, 2); assert.equal(f.commentService.state().paused, true); assert.equal(f.commentService.state().daily.attempts, 1); assert.equal(f.counts().decisions, 1);
+ });
+ 
++test('评论确定没发出去时记一笔跳过继续看，不结束整轮、不重试同一作品', async t => {
++  const f = fixture(t, { post: async () => ({ confirmed: false, deliveryUncertain: false, needsUserAction: true, reason: '当前评论区域归属尚未支持，未发布。' }) });
++  f.commentService.configure({ enabled: true, perSessionLimit: 3, dailyLimit: 5 }, { explicit: true }); f.watch.start({ startSession: true, maxRequests: 6 }, { explicit: true }); await f.watch.completion;
++  const state = f.watch.state();
++  assert.equal(state.status, 'stopped'); assert.equal(f.posts.length, 0);
++  const comment = f.events.find(event => event.type === 'watch.comment');
++  assert.equal(comment.delivery.confirmed, false); assert.equal(comment.delivery.deliveryUncertain, false);
++  assert.equal(f.events.some(event => event.type === 'watch.comment-skipped'), true);
++  assert.equal(f.commentService.state().daily.attempts, 1); assert.equal(f.commentService.state().paused, false);
++  assert.equal(f.watch.commentSkipStreak, 1);
++  // 观看继续推进：评论失败后仍有后续观察调用，而不是当场停下。
++  assert.equal(f.calls.filter(name => name === 'douyin_observe').length >= 2, true);
++});
++test('评论连续失败达到上限后本轮停用评论，观看继续且不再消耗评论模型请求', async t => {
++  const f = fixture(t), events = [];
++  f.watch.onEvent = event => { events.push(event); f.events.push(event); };
++  // 用一个恒为可评论的服务替身，确认停用只由连续失败决定，不影响观看额度。
++  f.watch.getCommentService = () => ({ context: () => ({ enabled: true, paused: false, remainingDaily: 3, remainingSession: 1 }) });
++  assert.equal(f.watch.commentContext().enabled, true);
++  for (let attempt = 1; attempt <= 2; attempt++) {
++    f.watch.recordCommentSkip('7579432563794584933', '评论输入几何见证未安装，未输入。');
++    assert.equal(f.watch.commentPaused, undefined, `第 ${attempt} 次仍应可评论`);
++    assert.equal(f.watch.commentContext().enabled, true);
++  }
++  f.watch.recordCommentSkip('7579432563794584933', '评论输入几何见证未安装，未输入。');
++  assert.equal(f.watch.commentPaused, true);
++  assert.equal(f.watch.commentContext().enabled, false);
++  assert.equal(events.filter(event => event.type === 'watch.comment-skipped').length, 3);
++  assert.equal(events.some(event => event.type === 'watch.comment-paused'), true);
++  // 停用只影响评论入口，不改写视频时长与请求额度状态。
++  assert.equal(f.videoLimits.state().session, null);
++  f.watch.commentSkipStreak = 0; f.watch.commentPaused = false;
++});
++
+ test('生成期间用户关闭许可或停止watch，返回的文本不会发布', async t => {
+   for (const mode of ['disabled', 'stopped']) {
+     const f = fixture(t), entered = Promise.withResolvers(); f.commentService.configure({ enabled: true }, { explicit: true });

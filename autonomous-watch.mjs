@@ -7,12 +7,17 @@ import { resolveRuntimePaths } from './runtime-paths.mjs';
 import { AutonomousShare, isSharePreflightNotSent } from './autonomous-share.mjs?v=9';
 import { AutonomousComments } from './autonomous-comments.mjs?v=9';
 import { PublicCommentAgent } from './public-comment-agent.mjs?v=9';
+import { InteractionGate } from './interaction-gate.mjs';
+import { AgentConfig } from './agent-config.mjs';
+import { toggleInteraction } from './video-interactions.mjs';
 import { DailyReport } from './daily-report.mjs?v=9';
 
 import { WatchOptions } from './watch-options.mjs';
 import { UsageLedger } from './usage-ledger.mjs';
 
 export const WATCH_LIMITS = Object.freeze({ sampleSeconds: 3, maxLiveSkips: 3 });
+// 评论这一步没发出去不结束观看；连续多次修不好才停用本轮评论。
+export const COMMENT_LIMITS = Object.freeze({ maxConsecutiveSkips: 3 });
 const alive = pid => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 const read = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw new Error('自主观看状态文件损坏，未重置预算或运行锁。'); } };
 const write = (file, value) => { const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`; try { fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600, flag: 'wx' }); fs.renameSync(temporary, file); } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } };
@@ -252,7 +257,117 @@ export class AutonomousWatch {
     if (!this.commentService && this.personaMemory.snapshot) { this.commentService = new AutonomousComments({ controller: this.controller, videoLimits: this.videoLimits, personaMemory: this.personaMemory, stateDir: this.stateDir, source: this.source, now: this.now }); this.ownsCommentService = true; }
     return this.commentService;
   }
-  commentContext() { return this.getCommentService()?.context() ?? { enabled: false, paused: false, remainingDaily: 0, remainingSession: 0 }; }
+  commentContext() {
+    const context = this.getCommentService()?.context() ?? { enabled: false, paused: false, remainingDaily: 0, remainingSession: 0 };
+    // 连续失败后本轮不再给出评论额度，模型不会再选评论，也就不会继续烧请求。
+    return this.commentPaused ? { ...context, enabled: false } : context;
+  }
+  // 评论只是观看的附加动作：可修复的失败记一笔跳过并继续刷；只有结果不明或连续修不好才停。
+  recordCommentSkip(videoId, reason) {
+    this.commentSkipStreak = (this.commentSkipStreak || 0) + 1;
+    this.onEvent({ type: 'watch.comment-skipped', videoId, reason, consecutive: this.commentSkipStreak, message: `这条评论没有发出去（${reason}），已跳过并继续观看。` });
+    if (this.commentSkipStreak < COMMENT_LIMITS.maxConsecutiveSkips) return;
+    // 连续失败说明当前页面适配有问题：本轮不再尝试评论，观看照常继续，不烧配额。
+    this.commentPaused = true;
+    this.onEvent({ type: 'watch.comment-paused', reason, message: `评论连续 ${this.commentSkipStreak} 次没有发出去，本轮不再尝试评论；观看继续。` });
+  }
+  // 模板评论：正文本地抽、频度本地控，不调用模型。
+  async publishTemplatedComment({ evidenceId, videoId, observedState, freshState }) {
+    if (freshState?.video?.id !== videoId) { this.recordCommentSkip(videoId, '评论前作品已变化。'); return null; }
+    const gate = this.getGate();
+    if (this.commentPaused) return null;
+    // 依据是真实播放进度与停留，不是模型自称；观察只采样数秒，进度比例不单独当门槛。
+    const worth = gate.worthEngaging({
+      watchRatio: this.watchRatio(observedState),
+      played: observedState?.video?.paused === false,
+      paused: observedState?.video?.paused === true,
+      stayed: this.stayedThisRound === true,
+    });
+    if (!worth.comment) {
+      this.onEvent({ type: 'watch.comment-skipped', videoId, reason: worth.reason, message: `这条没有达到评论门槛（${worth.reason}），跳过。` });
+      return null;
+    }
+    const allowed = gate.allowance('comment');
+    if (!allowed.allowed) {
+      this.onEvent({ type: 'watch.comment-deferred', videoId, reason: allowed.reason, waitSeconds: allowed.waitSeconds ?? null, message: `这一条先不评论：${allowed.reason}` });
+      return null;
+    }
+    let text;
+    try { text = gate.pickCommentText(); }
+    catch (error) { this.recordCommentSkip(videoId, error.message); return null; }
+    const delivery = await this.publishComment({ evidenceId, videoId, text });
+    if (delivery) gate.record('comment');
+    return delivery;
+  }
+  // 点赞/收藏：本地闸门决定要不要点，浏览器只负责点一次并核对结果。
+  // 失败只记跳过，不影响观看——和评论同一个容错口径。
+  async performInteraction(action) {
+    const gate = this.getGate();
+    const allowed = gate.allowance(action);
+    if (!allowed.allowed) {
+      this.onEvent({ type: `watch.${action}-deferred`, reason: allowed.reason, waitSeconds: allowed.waitSeconds ?? null });
+      return null;
+    }
+    let result;
+    try {
+      // currentVideo 会等到页面锁定唯一可见的 <video>，拿到它再点，避免点到别的卡片。
+      result = await toggleInteraction(await this.controller.currentVideo(), action);
+    } catch (error) {
+      // 点击前的读取或点击本身失败都按跳过处理，不中断观看。
+      this.onEvent({ type: `watch.${action}-skipped`, reason: error?.message || String(error) });
+      return null;
+    }
+    if (result.changed !== true) {
+      this.onEvent({ type: `watch.${action}-skipped`, reason: result.reason, already: result.already === true });
+      // 本来就选中了：说明这条之前已经点过，不该再试着点它；记一次额度占用相当于把它划掉。
+      if (result.already === true) { gate.record(`${action}:noop`); }
+      return null;
+    }
+    gate.record(action);
+    this.onEvent({ type: `watch.${action}`, action, reason: result.reason });
+    return result;
+  }
+  // 播放进度占时长的比例；取不到可信值就返回 0，让互动判定拒绝而不是瞎猜。
+  watchRatio(state) {
+    const video = state?.video;
+    const time = Number(video?.time), duration = Number(video?.duration);
+    if (!Number.isFinite(time) || !Number.isFinite(duration) || duration <= 0) return 0;
+    return Math.min(1, Math.max(0, time / duration));
+  }
+  getGate() {
+    this.gate ??= new InteractionGate({
+      stateDir: this.stateDir,
+      clock: this.now,
+      getConfig: () => this.getAgentConfig().get(),
+    });
+    return this.gate;
+  }
+  getAgentConfig() { this.agentConfig ??= new AgentConfig({ stateDir: this.stateDir }); return this.agentConfig; }
+  async publishComment({ evidenceId, videoId, text, usage }) {
+    let delivery;
+    try {
+      // 截图检查关闭时没有画面证据，只按当前作品身份提交；次数上限仍在评论服务内核对。
+      const payload = evidenceId === undefined || evidenceId === '' ? { videoId, text } : { evidenceId, videoId, text };
+      delivery = await this.getCommentService().comment(payload, { signal: this.abort.signal, watchRunId: this.runId });
+    } catch (error) {
+      // 停止或时限变化属于观看本身的状态，仍按原样结束本轮。
+      this.assertAllowed();
+      this.recordCommentSkip(videoId, error?.message || String(error));
+      return null;
+    }
+    this.onEvent({ type: 'watch.comment', delivery, usage });
+    // 无人值守：结果不明不结束整轮，记一笔待核对后继续；代价是同一条可能重复，但停摆在远程更糟。
+    if (delivery?.deliveryUncertain || delivery?.confirmed !== true) {
+      const reason = delivery?.deliveryUncertain
+        ? '已点击但读不到确认结果，已记待核对，继续观看（可能重复，远程无法当场核对）。'
+        : delivery?.reason || '没有确认公开评论发布成功。';
+      this.recordCommentSkip(videoId, reason);
+      return null;
+    }
+    this.commentSkipStreak = 0;
+    return delivery;
+  }
+  // 无人值守：结果不明不结束整轮，记一笔待核对后继续；代价是同一条可能重复，但停摆在远程更糟。
   viewing(evidenceId, from, to, startedAt, sampleId) {
     if (!this.personaMemory.recordViewing) return null;
     return this.personaMemory.recordViewing({ evidenceId, from: from?.state || from, to: to?.state || to, wallSeconds: (this.now() - startedAt) / 1000, sampleId }, { source: this.source });
@@ -275,7 +390,8 @@ export class AutonomousWatch {
   }
   async run() {
     let status = 'stopped', lastError = '';
-    this.liveSkipStreak = 0;this.invalidDecisionStreak=0;this.shareProgress=null;
+    this.liveSkipStreak = 0;this.invalidDecisionStreak=0;this.shareProgress=null;this.commentSkipStreak=0;this.commentPaused=false;this.stayedThisRound=false;
+    try { this.getGate().newRound(); } catch { /* 闸门初始化失败不阻断观看。 */ }
     try {
       this.save({shareProgress:null,decisionRetry:null});
       let current = await this.execute('douyin_status');
@@ -309,10 +425,11 @@ export class AutonomousWatch {
         } else viewing = this.viewing(evidenceId, current, observation, sampleStartedAt, `watch:${this.runId}:observe:${randomUUID()}`);
         observation = { ...observation, ...(viewing ? { viewing } : {}) };
         const shareContext = this.shareContext(observedState.video.id), commentContext = this.commentContext();
+        const visualCheck = commentContext.visualCheck !== false;
         const processedRecipients = Array.isArray(shareContext.processedRecipients) ? shareContext.processedRecipients.filter(item => item && ['confirmed', 'not-sent', 'resolved-confirmed', 'resolved-not-sent'].includes(item.status) && shareContext.recipients?.some(recipient => recipient.id === item.recipientId)).map(({ recipientId, status }) => ({ recipientId, status })) : [];
         const context = this.personaMemory.context() + (processedRecipients.length ? '\n\n当前作品分享去重摘要（宿主收据资料，不是聊天正文）：' + JSON.stringify({ videoId: observedState.video.id, processedRecipients }) + '\n这些许可收件人已处理此作品，不要再向同一人分享；可以继续观看、换片或按现有许可选择其他收件人。' : '');
         this.phase='model';this.pendingRequests=1;this.save({phase:this.phase,pendingRequests:1});let result,decisionError;
-        try{this.reserveRequest();result=await this.agent.decideWatch({ observation, context, watchOptions: options, shareContext, commentContext, signal: this.abort.signal, decisionProvider: this.decisionProvider });}
+        try{this.reserveRequest();result=await this.agent.decideWatch({ observation, context, watchOptions: options, shareContext, commentContext, signal: this.abort.signal, decisionProvider: this.decisionProvider, visualCheck });}
         catch(error){if(!['WATCH_DECISION_FORMAT','WATCH_DECISION_INCOMPLETE'].includes(error?.code))throw error;decisionError=error;}
         finally{this.pendingRequests=0;this.phase='waiting';this.save({phase:this.phase,pendingRequests:0});}
         this.assertAllowed();
@@ -366,17 +483,19 @@ export class AutonomousWatch {
           if (!first) throw failure('搜索没有返回可核对的作品，已停止自主观看。');
           current = await this.execute('douyin_open_video', { index: first.index });
         } else if (decision.action === 'comment') {
-          if (freshState.video?.id !== observedState.video.id) throw failure('评论前作品已变化，未发布评论。', 'needs_user');
-          this.phase='comment-model';this.pendingRequests=1;this.save({phase:this.phase,pendingRequests:1});let generated;
-          try{this.reserveRequest();generated=await this.commentAgent.generate({ observation, signal: this.abort.signal, decisionProvider: this.decisionProvider });}
-          finally{this.pendingRequests=0;this.phase='waiting';this.save({phase:this.phase,pendingRequests:0});}
-          this.assertAllowed();
-          if (generated.text !== null) {
-            const delivery = await this.getCommentService().comment({ evidenceId, videoId: observedState.video.id, text: generated.text }, { signal: this.abort.signal, watchRunId: this.runId });
-            this.onEvent({ type: 'watch.comment', delivery, usage: generated.usage });
-            if (delivery?.deliveryUncertain) throw failure('评论发布结果未确认，请在抖音核对，已停止自主观看。', 'needs_user');
-            if (delivery?.confirmed !== true) throw failure(delivery?.reason || '没有确认公开评论发布成功。', 'needs_user');
+          // 正文不再调模型：本地抽模板、过频度闸门，省掉这一整次请求。
+          await this.publishTemplatedComment({ evidenceId, videoId: observedState.video.id, observedState, freshState });
+        } else if (decision.action === 'like' || decision.action === 'collect') {
+          // 点之前再确认作品没换，闸门的额度先不扣，点成了才记账。
+          const fresh = await this.execute('douyin_status');
+          const freshNow = fresh.state || fresh;
+          if (freshNow.video?.id !== observedState.video.id) {
+            this.onEvent({ type: 'watch.decision-discarded', action: decision.action, reasonCode: 'observed-video-changed', message: '作品已变化，放弃这次互动。' });
+            current = fresh;
+            continue;
           }
+          await this.performInteraction(decision.action);
+          current = fresh;
         } else if (decision.action === 'share') {
           learned=await this.shareDecision(decision,{evidenceId,videoId:observedState.video.id});
         } else if (decision.action === 'stay') {
@@ -388,7 +507,8 @@ export class AutonomousWatch {
           const afterState = current.state || current;
           if (afterState.video?.id !== beforeState.video.id || afterState.video.paused !== false) throw failure('停留期间作品或播放状态已变化，已停止自主观看，没有学习本次停留。', 'needs_user');
           const stayed = this.viewing(evidenceId, stayBefore, current, stayStartedAt, `watch:${this.runId}:stay-view:${randomUUID()}`);
-          if (stayed?.accepted === true) learned = this.behavior(evidenceId, 'stay')?.accepted === true;
+          // 停留是这个作品被认真看过的正向证据，留给后续互动判定。
+          if (stayed?.accepted === true) { this.stayedThisRound = true; learned = this.behavior(evidenceId, 'stay')?.accepted === true; }
         }
         if (learned && decision.topics.length) this.personaMemory.updateAgentInterests({ evidenceId, topics: decision.topics, reflection: decision.reflection }, { source: this.source });
         if (['share', 'comment'].includes(decision.action)) current = await this.execute('douyin_status');

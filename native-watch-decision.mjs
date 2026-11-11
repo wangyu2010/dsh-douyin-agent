@@ -14,6 +14,7 @@ export function createNativeWatchDecision({ llm, attachments, agent, maxTokens =
     const info = await llm.resolveModelInfo(provider, model, signal);
     const shortReplyControls = Array.isArray(info?.reasoning?.efforts) && info.reasoning.efforts.some(effort => effort.id === 'off') ? { reasoningEffort: 'off' } : {};
     const hasImages = messages.some(message => Array.isArray(message.content) && message.content.some(part => part.type === 'image_url'));
+    // 用户关闭「截图分析视频」后请求里不再有画面；只有真的要发图才核对图片能力。
     if (hasImages && (!info?.inputModalities?.includes('image') || typeof attachments?.saveImages !== 'function')) throw new Error('当前 DSH 模型或附件服务不能接收实际视频画面，已停止自主观看。');
     const converted = [];
     for (const message of messages) {
