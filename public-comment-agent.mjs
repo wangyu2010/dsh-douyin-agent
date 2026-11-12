@@ -1,4 +1,4 @@
-import { watchDecisionMessages } from './api-agent.mjs?v=9';
+import { watchDecisionMessages } from './api-agent.mjs?v=20';
 import { videoImageParts } from './video-storyboard.mjs';
 import { prepareCommentText } from './comment-text.mjs';
 

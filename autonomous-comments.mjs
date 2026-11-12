@@ -18,11 +18,9 @@ function read(file, fallback) {
   try { const stat = fs.lstatSync(file); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4_194_304) throw Error(); return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch (error) { if (error.code === 'ENOENT') return fallback; throw fail('自主评论记录无法核对，未重置许可、预算或待核对收据。'); }
 }
-function write(file, value) {
-  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  try { const descriptor = fs.openSync(temporary, 'wx', 0o600); try { fs.writeFileSync(descriptor, JSON.stringify(value, null, 2) + '\n'); fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); } fs.renameSync(temporary, file); }
-  finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
-}
+// 原子写统一走公共模块。评论收据丢了比写慢更严重，所以保留 fsync。
+import { writeJson } from './atomic-write.mjs';
+const write = (file, value) => writeJson(file, value, { fsync: true });
 
 
 
@@ -43,14 +41,21 @@ export class AutonomousComments {
   }
   control(action) { const release = this.acquireControl(); try { return action(); } finally { release(); } }
   policy() {
-    const value = read(this.files.policy, { version: 1, enabled: false, dailyLimit: 3, perSessionLimit: 1 });
+    // 默认开启：这是运营助手，评论是核心动作之一，装完就该能用。
+    // 原来的默认值是 false，导致状态文件不存在时评论永远不触发——用户装完完全不知道为什么没评论。
+    const value = read(this.files.policy, { version: 1, enabled: true, dailyLimit: 20, perSessionLimit: 3 });
     // visualCheck 缺省为 true：老记录不受影响，仍走带画面的前置检查。
-    if (!value || value.version !== 1 || typeof value.enabled !== 'boolean' || !Number.isSafeInteger(value.dailyLimit) || value.dailyLimit < 1 || value.dailyLimit > 20 || !Number.isSafeInteger(value.perSessionLimit) || value.perSessionLimit < 1 || value.perSessionLimit > 3 || value.visualCheck !== undefined && typeof value.visualCheck !== 'boolean') throw fail('自主评论许可或次数上限损坏，未继续评论。');
+    // 单轮上限放宽到 20：一轮自动观看 15-20 分钟，每几分钟一条属正常运营节奏，
+    // 原来卡死 3 条会让「看几分钟评一条」跑到第三轮就再也评不动。
+    if (!value || value.version !== 1 || typeof value.enabled !== 'boolean' || !Number.isSafeInteger(value.dailyLimit) || value.dailyLimit < 1 || value.dailyLimit > 50 || !Number.isSafeInteger(value.perSessionLimit) || value.perSessionLimit < 1 || value.perSessionLimit > 20 || value.visualCheck !== undefined && typeof value.visualCheck !== 'boolean') throw fail('自主评论许可或次数上限损坏，未继续评论。');
     return { ...value, visualCheck: value.visualCheck !== false };
   }
   ledger() {
     const value = read(this.files.ledger, { version: 1, days: {}, sessions: {}, operations: [] });
-    if (!value || value.version !== 1 || !value.days || typeof value.days !== 'object' || Array.isArray(value.days) || !value.sessions || typeof value.sessions !== 'object' || Array.isArray(value.sessions) || [...Object.values(value.days), ...Object.values(value.sessions)].some(count => !Number.isSafeInteger(count) || count < 0) || !Array.isArray(value.operations) || value.operations.some(item => !item || !identifier(item.operationId) || !statuses.has(item.status) || !videoIdentity(item.videoId) || !(item.evidenceId === undefined || item.evidenceId === '' || evidencePattern.test(item.evidenceId)) || !identifier(item.sessionId) || !identifier(item.runId) || !/^\d{4}-\d{2}-\d{2}$/.test(item.day) || !['api', 'dsh'].includes(item.source) || !Number.isSafeInteger(item.pid) || item.pid < 1 || typeof item.text !== 'string' || [...item.text].length < 1 || [...item.text].length > 200 || item.status === 'confirmed' && !identifier(item.commentId)) || new Set(value.operations.map(item => item.operationId)).size !== value.operations.length || new Set(value.operations.map(item => item.videoId)).size !== value.operations.length) throw fail('自主评论预算或收据损坏，未重新计数。');
+    // 注意：confirmed 记录不要求 commentId——抖音评论没有稳定 ID（data-comment-id 实测为 null），
+    // 浏览器层用「评论数+1 且首条刚刚」确认成功，commentId 有就带、没有就不带。
+    // 原来这里强制要求，导致所有真实发出的评论要么被记成 uncertain，要么让整份账本校验失败、启动就死。
+    if (!value || value.version !== 1 || !value.days || typeof value.days !== 'object' || Array.isArray(value.days) || !value.sessions || typeof value.sessions !== 'object' || Array.isArray(value.sessions) || [...Object.values(value.days), ...Object.values(value.sessions)].some(count => !Number.isSafeInteger(count) || count < 0) || !Array.isArray(value.operations) || value.operations.some(item => !item || !identifier(item.operationId) || !statuses.has(item.status) || !videoIdentity(item.videoId) || !(item.evidenceId === undefined || item.evidenceId === '' || evidencePattern.test(item.evidenceId)) || !identifier(item.sessionId) || !identifier(item.runId) || !/^\d{4}-\d{2}-\d{2}$/.test(item.day) || !['api', 'dsh'].includes(item.source) || !Number.isSafeInteger(item.pid) || item.pid < 1 || typeof item.text !== 'string' || [...item.text].length < 1 || [...item.text].length > 200) || new Set(value.operations.map(item => item.operationId)).size !== value.operations.length || new Set(value.operations.map(item => item.videoId)).size !== value.operations.length) throw fail('自主评论预算或收据损坏，未重新计数。');
     const days = {}, sessions = {};
     for (const operation of value.operations) { days[operation.day] = (days[operation.day] || 0) + 1; sessions[operation.sessionId] = (sessions[operation.sessionId] || 0) + 1; }
     if (Object.entries(days).some(([key, count]) => (value.days[key] || 0) < count) || Object.entries(sessions).some(([key, count]) => (value.sessions[key] || 0) < count)) throw fail('评论预算小于已有处理记录，未重置次数。');
@@ -66,7 +71,7 @@ export class AutonomousComments {
   context() { const state = this.state(); return { enabled: Boolean(state.enabled && !state.paused && state.daily.remaining > 0 && state.session.remaining > 0 && this.videoLimits.state().allowed), visualCheck: state.visualCheck, remainingDaily: state.daily.remaining, remainingSession: state.session.remaining, paused: state.paused, maxTextLength: 200 }; }
   configure(input = {}, { explicit = false } = {}) {
     if (!explicit) throw fail('自主评论许可只能由用户在本机设置。', 403);
-    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['enabled', 'dailyLimit', 'perSessionLimit', 'visualCheck'].includes(key)) || typeof input.enabled !== 'boolean' || input.visualCheck !== undefined && typeof input.visualCheck !== 'boolean' || input.dailyLimit !== undefined && (!Number.isSafeInteger(input.dailyLimit) || input.dailyLimit < 1 || input.dailyLimit > 20) || input.perSessionLimit !== undefined && (!Number.isSafeInteger(input.perSessionLimit) || input.perSessionLimit < 1 || input.perSessionLimit > 3)) throw fail('评论设置只接受总开关、截图分析开关、每日 1 至 20 次和单轮 1 至 3 次上限。', 400);
+    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['enabled', 'dailyLimit', 'perSessionLimit', 'visualCheck'].includes(key)) || typeof input.enabled !== 'boolean' || input.visualCheck !== undefined && typeof input.visualCheck !== 'boolean' || input.dailyLimit !== undefined && (!Number.isSafeInteger(input.dailyLimit) || input.dailyLimit < 1 || input.dailyLimit > 50) || input.perSessionLimit !== undefined && (!Number.isSafeInteger(input.perSessionLimit) || input.perSessionLimit < 1 || input.perSessionLimit > 20)) throw fail('评论设置只接受总开关、截图分析开关、每日 1 至 50 次和单轮 1 至 20 次上限。', 400);
     this.control(() => { const policy = this.policy(); if (input.enabled && (this.unresolved().length || this.state().recoveryRequired)) throw fail('上次评论结果需要核对；重新开关不能清除未确认记录。'); write(this.files.policy, { ...policy, enabled: input.enabled, visualCheck: input.visualCheck ?? policy.visualCheck, dailyLimit: input.dailyLimit ?? policy.dailyLimit, perSessionLimit: input.perSessionLimit ?? policy.perSessionLimit }); });
     if (!input.enabled) this.active?.abort.abort(fail('用户关闭了自主评论。'));
     return this.state();
@@ -129,7 +134,12 @@ export class AutonomousComments {
       let post = this.post;
       if (!post) { let commenter = await (this.getCommenter ? this.getCommenter() : this.controller?.getCommenter?.()); if (!commenter) { const { CommentBrowser } = await import('./comment-browser.mjs'); this.ownedCommenter ??= new CommentBrowser({ source: this.source, videoLimits: this.videoLimits, stateDir: this.stateDir }); commenter = this.ownedCommenter; } if (typeof commenter.post !== 'function') throw fail('当前评论适配尚未提供可核对的发布接口。'); post = commenter.post.bind(commenter); }
       const result = await post({ expectedVideoId: input.videoId, text: input.text }, { signal: combined, authorize, autonomousRunId: watchRunId });
-      const confirmed = clicking && result?.confirmed === true && result.videoId === input.videoId && identifier(result.commentId), uncertain = !confirmed && (clicking || result?.deliveryUncertain === true || result?.confirmed === true);
+      // 浏览器层已经用「评论数 +1 且首条显示刚刚」确认过了，那就是真的发出去了。
+      // 原来这里还要求 commentId，但抖音评论没有稳定的 ID 属性（data-comment-id 实测为 null），
+      // 于是每条成功发出的评论都被误判成 uncertain，上层永远显示「评论 0 条」。
+      // commentId 有就带上，没有也不影响成功判定。
+      const confirmed = clicking && result?.confirmed === true && result.videoId === input.videoId;
+      const uncertain = !confirmed && (clicking || result?.deliveryUncertain === true);
       this.update(operationId, { status: confirmed ? 'confirmed' : uncertain ? 'uncertain' : 'not-sent', completedAt: new Date(this.now()).toISOString(), ...(identifier(result?.operationId) ? { browserOperationId: result.operationId } : {}), ...(confirmed ? { commentId: result.commentId } : {}) });
       return { confirmed, deliveryUncertain: uncertain, operationId, videoId: input.videoId, ...(confirmed ? { commentId: result.commentId } : { reason: uncertain ? '评论发布结果未确认，已暂停后续评论，请在抖音核对。' : result?.reason || '没有发布可核对的新评论，未改用其他发送方式。', ...(result?.needsUserAction ? { needsUserAction: true } : {}) }) };
     } catch (error) {

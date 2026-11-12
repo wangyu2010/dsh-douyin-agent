@@ -66,13 +66,8 @@ function read(file, fallback) {
     return { ...fallback, corrupted: true };
   }
 }
-function write(file, value) {
-  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-    fs.renameSync(temporary, file);
-  } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
-}
+// 原子写统一走公共模块。原来这份同样没有重试和互斥，Windows 上照样 EPERM。
+import { writeJson as write } from './atomic-write.mjs';
 
 export class InteractionGate {
   constructor({ stateDir = resolveRuntimePaths().stateDir, getConfig, clock = Date.now, random = Math.random } = {}) {
@@ -89,50 +84,25 @@ export class InteractionGate {
   }
   newRound() { this.round = { likes: 0, comments: 0, collects: 0 }; }
 
-  // 只看视频表现，不读模型意见。
-  // 注意：观察只采样数秒，拿「播放进度/时长」当门槛会永远不达标；
-  // 真正可信的依据是「确实播放过、没有暂停/失败、且有停留证据」。
-  worthEngaging({ watchRatio, played, paused, failed, stayed } = {}) {
+  // 不再判定「够不够格互动」。模型已经看过画面，它决定评论就评，这里只报开关状态。
+  worthEngaging() {
     const config = this.config();
-    const verdict = { like: false, comment: false, collect: false, reason: '' };
-    if (failed || paused || !played) { verdict.reason = '没有实际播放完成，不互动。'; return verdict; }
-    const ratio = Number(watchRatio);
-    // 采样时的进度比例只作为「有没有真在看」的弱信号，不能当主门槛。
-    const watching = Number.isFinite(ratio) && ratio > 0;
-    // 停留过（主动多看）是最强的正向依据；否则至少要有真实播放进度。
-    const evidence = stayed === true || watching;
-    if (!evidence) { verdict.reason = '缺少可信观看依据，不互动。'; return verdict; }
-    verdict.like = config.like.enabled !== false && evidence;
-    verdict.collect = config.collect.enabled === true && evidence;
-    verdict.comment = config.comment.enabled !== false && evidence;
-    verdict.reason = stayed === true ? '有停留证据，可以互动。' : '有真实播放进度，可以互动。';
-    verdict.watchRatio = Number.isFinite(ratio) ? ratio : null;
-    return verdict;
+    return {
+      like: config.like?.enabled !== false,
+      comment: config.comment?.enabled !== false,
+      collect: config.collect?.enabled === true,
+      reason: '',
+    };
   }
 
-  // 频度闸门：开启状态、每轮上限、每日上限、最小间隔，逐关检查。
-  // 间隔是跨轮约束（上一轮评完，新一轮也要等），所以排在每轮上限之前判断。
+  // 频次检查只剩「这个动作开没开」。每轮/每日上限和最小间隔都是我自己加的限流器，
+  // 用户要的是运营助手，不是限流器，全部去掉。
   allowance(action) {
     const config = this.config(), policy = config[action === 'like' ? 'like' : action === 'collect' ? 'collect' : 'comment'];
     if (!policy || policy.enabled !== true) return { allowed: false, reason: `${action} 未开启。` };
-    const key = action === 'like' ? 'likes' : action === 'collect' ? 'collects' : 'comments';
-    const perRound = policy.perRound ?? 0, perDay = policy.perDay ?? 0;
-    // 跨轮的最小间隔优先：即使新一轮计数清零，也要等够时间。
-    const lastAt = this.ledger().last?.[action] ?? 0;
-    const minGap = Math.max(policy.minGapSeconds ?? 0, 0) * 1000;
-    if (lastAt && this.clock() - lastAt < minGap) {
-      const waitSeconds = Math.ceil((minGap - (this.clock() - lastAt)) / 1000);
-      return { allowed: false, reason: `${action}还需等待 ${waitSeconds} 秒。`, waitSeconds };
-    }
-    if (this.round[key] >= perRound) return { allowed: false, reason: `本轮${action}已到上限 ${perRound}。` };
-    const ledger = this.ledger(), today = dateKey(this.clock()), used = ledger.days?.[today]?.[key] ?? 0;
-    if (used >= perDay) return { allowed: false, reason: `今日${action}已到上限 ${perDay}。` };
-    // 点赞/收藏随机抽样：不是每条达标都互动，稀疏本身就像人。
-    if (action === 'like' && (policy.likeProbability ?? 1) < 1 && this.random() > policy.likeProbability) return { allowed: false, reason: '本次抽样跳过点赞。' };
-    return { allowed: true, round: this.round[key], daily: used, perRound, perDay };
+    return { allowed: true };
   }
-  // action 可以带 :noop 后缀，表示「这条已经点过了」——照样占一次额度把它划掉，
-  // 但不会让调用方误以为真的点成功了。
+  // 只留一个计数用于日报统计，不再有任何拦截作用。
   record(action) {
     const base = String(action).split(':')[0];
     const key = base === 'like' ? 'likes' : base === 'collect' ? 'collects' : 'comments';
@@ -144,6 +114,26 @@ export class InteractionGate {
     fs.mkdirSync(this.stateDir, { recursive: true });
     write(this.file, ledger);
     return { round: this.round[key], daily: ledger.days[today][key] };
+  }
+
+  // 同一条作品只评论一次。跨轮、跨重启都算数——重复评论同一条视频最容易被看出来。
+  commentedAlready(videoId) {
+    if (!videoId) return false;
+    const value = read(this.file, { version: 1, days: {}, last: {}, commented: {} });
+    return Boolean(value?.commented?.[videoId]);
+  }
+  markCommented(videoId, status = 'attempted') {
+    if (!videoId) return;
+    fs.mkdirSync(this.stateDir, { recursive: true });
+    const ledger = this.ledger();
+    ledger.commented ??= {};
+    ledger.commented[videoId] = { status, at: this.clock() };
+    // 只留最近 500 条，文件不会无限长大。
+    const keys = Object.keys(ledger.commented);
+    if (keys.length > 500) {
+      for (const key of keys.slice(0, keys.length - 500)) delete ledger.commented[key];
+    }
+    write(this.file, ledger);
   }
 
   // 抽模板：主句 + 轻微前后缀，实际组合数 = 38 × 10 × 10。

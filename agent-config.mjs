@@ -38,6 +38,7 @@ export const AGENT_DEFAULTS = Object.freeze({
     enabled: true,
     perRound: 1,
     perDay: 6,
+    everySeconds: 180,             // 定时评论：每看这么久就发一条，由程序控制，不问模型
     minGapSeconds: 240,            // 评论延迟：连续评论最容易触发流控
     maxGapSeconds: 600,
     visualCheck: true,             // 是否先截图核对画面
@@ -63,7 +64,7 @@ const LIMITS = {
   'watch.retryBackoffSeconds': [10, 3600], 'watch.maxRetriesPerSlot': [0, 20],
   'like.perRound': [0, 20], 'like.perDay': [0, 200],
   'like.minWatchRatio': [0, 1], 'like.minGapSeconds': [0, 3600], 'like.likeProbability': [0, 1],
-  'comment.perRound': [0, 10], 'comment.perDay': [0, 100], 'comment.minGapSeconds': [0, 7200],
+  'comment.perRound': [0, 10], 'comment.perDay': [0, 100], 'comment.everySeconds': [30, 7200], 'comment.minGapSeconds': [0, 7200],
   'comment.maxGapSeconds': [0, 14400], 'comment.minWatchRatio': [0, 1],
   'collect.perRound': [0, 10], 'collect.perDay': [0, 100],
   'pace.minGapSeconds': [0, 3600], 'pace.maxGapSeconds': [0, 7200],

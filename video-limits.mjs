@@ -9,7 +9,10 @@ const READ_ACTIONS = new Set(['douyin_status', 'douyin_pause', 'douyin_recall', 
 export const DEFAULT_VIDEO_POLICY = Object.freeze({ version: 1, timeZone: 'Asia/Shanghai', enabled:false, windows: ['00:00-24:00'], dailyMinutes: 10, dailyRequests:30 });
 const shanghai = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
-function write(file, value) { const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`; fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600 }); fs.renameSync(temporary, file); }
+
+// 原子写统一走公共模块，不再自己实现一份。
+// 之前这里有份本地实现，而其它模块各有各的——修好一处另一处照样 EPERM。
+import { writeJson as write } from './atomic-write.mjs';
 function initialize(file, value) { let descriptor; try { descriptor = fs.openSync(file, 'wx', 0o600); } catch (error) { if (error.code === 'EEXIST') return; throw error; } try { fs.writeFileSync(descriptor, JSON.stringify(value, null, 2)); } finally { fs.closeSync(descriptor); } }
 function sourceName(source) { if (!SOURCES.includes(source)) throw new Error('刷视频入口只能是 api 或 dsh。'); return source; }
 function parseWindow(value) {

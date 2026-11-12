@@ -7,6 +7,7 @@ import { VideoLimits } from './video-limits.mjs';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
 import { prepareCommentText } from './comment-text.mjs';
 import { humanClick, ensureEditorText, clearEditor, normalizeDraft, createRandom } from './human-input.mjs';
+import { writeJson } from './atomic-write.mjs';
 
 // 评论发布器（最小可用版）。
 // 2026-11-11 在已登录专用 Edge 上实测通过真实发布，据此重写：
@@ -18,6 +19,33 @@ import { humanClick, ensureEditorText, clearEditor, normalizeDraft, createRandom
 
 const stop = signal => signal?.throwIfAborted();
 const cleanDraft = value => String(value ?? '').replace(/[\u200B-\u200F\uFEFF]/g, '').trim();
+// 判断输入框里的残留是不是我们自己抽的模板句。
+// 发布流程中途失败时（例如许可被拒、点击超时），文本已经打进输入框但没写收据，
+// 下次就认不出来，会被当成「用户草稿」永久挡住。这里用模板池兜底识别。
+let corePoolCache = null;
+async function corePool() {
+  if (corePoolCache) return corePoolCache;
+  try {
+    const { CORE_TEMPLATES } = await import('./interaction-gate.mjs');
+    corePoolCache = CORE_TEMPLATES.map(item => String(item).replace(/[。！!]+$/u, '')).filter(Boolean);
+  } catch { corePoolCache = []; }
+  return corePoolCache;
+}
+// 只要句子里「包含」某个模板主句，就认定是我们自己发的。
+// 前后缀只是贴在主句外面，包含主句就足够判定，不需要把前缀后缀也导进来。
+// 另外：前后缀本身也能拼出句子（如「说真的，…，学到了」），
+// 所以再补一条：句子里同时出现两个以上我们的常用词，也算自己的残留。
+const OUR_MARKERS = ['学到了', '支持一下', '继续加油', '收藏了', '期待更多', '看完觉得', '不得不说', '讲真', '说真的', '整体上', '挺有', '不错', '在理', '舒服', '到位', '扎实', '实用', '有收获', '讲得'];
+async function looksLikeOurTemplate(value) {
+  const text = cleanDraft(value);
+  if (!text || text.length > 200) return false;
+  // 模板句都是通用赞美，出现链接、@、长数字的一律当作别人的东西，不动。
+  if (/https?:\/\/|@|\.com|\d{5,}/.test(text)) return false;
+  const pool = await corePool();
+  if (pool.some(core => core.length >= 4 && text.includes(core))) return true;
+  const hits = OUR_MARKERS.filter(word => text.includes(word)).length;
+  return hits >= 2;
+}
 const SEND_BUTTON_CLASS = 'oXIqR6qH';
 const COMMENT_ICON = '[data-e2e="feed-comment-icon"]';
 const INPUT_AREA = '.comment-input-inner-container';
@@ -118,9 +146,8 @@ export class CommentBrowser {
     const index = value.operations.findIndex(item => item.operationId === operation.operationId);
     if (index < 0) value.operations.push(operation); else value.operations[index] = operation;
     fs.mkdirSync(this.stateDir, { recursive: true });
-    const temporary = `${this.receiptsFile}.${randomUUID()}.tmp`;
-    try { fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { flag: 'wx', mode: 0o600 }); fs.renameSync(temporary, this.receiptsFile); }
-    finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
+    // 原子写统一走公共模块：这份回执之前也自带一份 rename 实现，Windows 上会 EPERM。
+    writeJson(this.receiptsFile, value);
   }
   acquire() {
     fs.mkdirSync(this.stateDir, { recursive: true });
@@ -140,9 +167,23 @@ export class CommentBrowser {
       return [...document.querySelectorAll(sel)].some(visible);
     }, INPUT_AREA);
     if (await opened()) return true;
-    const icon = page.locator(COMMENT_ICON).first();
-    if (await icon.count() === 0) return false;
-    await icon.click({ timeout: 5000 }).catch(() => {});
+    // 推荐流是轮播，DOM 里同时存在相邻几条的评论图标，只有一条在当前视口内。
+    // 用 .first() 会点到视口外那个，点击无效且永远打不开评论区。
+    const point = await page.evaluate(sel => {
+      const nodes = [...document.querySelectorAll(sel)];
+      for (let i = 0; i < nodes.length; i++) {
+        const r = nodes[i].getBoundingClientRect(), s = getComputedStyle(nodes[i]);
+        if (r.width <= 0 || r.height <= 0 || s.display === 'none' || s.visibility === 'hidden') continue;
+        if (r.top < 0 || r.bottom > innerHeight || r.left < 0 || r.right > innerWidth) continue;
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }
+      return null;
+    }, COMMENT_ICON);
+    if (!point) return false;
+    // 真实鼠标移动 + 点击：force 点击会绕过命中检测，页面收不到事件。
+    await page.mouse.move(point.x, point.y, { steps: 8 + Math.floor(Math.random() * 6) });
+    await page.waitForTimeout(100 + Math.floor(Math.random() * 150));
+    await page.mouse.click(point.x, point.y, { delay: 40 + Math.floor(Math.random() * 60) });
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
       stop(signal);
@@ -176,7 +217,8 @@ export class CommentBrowser {
     return null;
   }
 
-  // 发布按钮：工具栏内 class 含 oXIqR6qH 的 span（实测是工具栏第 4 个 span，红色图标）。
+  // 发布按钮：工具栏内红色（#FE2C55）且不透明的发送箭头 span。
+  // 抖音会改混淆 class（oXIqR6qH → wchsYBpK jfGCpJo0），但 svg 红色+opacity=1 这个特征稳定。
   // 它是输入文字之后才出现的，所以要一直等到超时，不能只等一下。
   async findSend(page, signal, timeoutMs = 10000) {
     const deadline = Date.now() + timeoutMs;
@@ -185,9 +227,19 @@ export class CommentBrowser {
       const count = await page.evaluate(sel => {
         const toolbar = document.querySelector('.commentInput-right-ct, [class*="commentInput-right"]');
         if (!toolbar) return 0;
-        return [...toolbar.querySelectorAll(`span[class*="${sel}"]`)].filter(el => { const r = el.getBoundingClientRect(); return r.width > 12 && r.height > 12; }).length;
+        return [...toolbar.querySelectorAll('span')].filter(el => {
+          const r = el.getBoundingClientRect();
+          if (r.width <= 12 || r.height <= 12) return false;
+          const path = el.querySelector('svg path');
+          if (!path) return false;
+          if ((path.getAttribute('fill') || '').toUpperCase() !== '#FE2C55') return false;
+          return Number(getComputedStyle(el).opacity) > 0.9;
+        }).length;
       }, SEND_BUTTON_CLASS).catch(() => 0);
-      if (count >= 1) return page.locator(`.commentInput-right-ct span[class*="${SEND_BUTTON_CLASS}"], [class*="commentInput-right"] span[class*="${SEND_BUTTON_CLASS}"]`).filter({ visible: true }).first();
+      if (count >= 1) return page.locator('.commentInput-right-ct span, [class*="commentInput-right"] span').filter({
+        visible: true,
+        has: page.locator('svg path[fill="#FE2C55"], svg path[fill="#fe2c55"]'),
+      }).first();
       await waitForCommentTick(250, undefined, { signal });
     } while (Date.now() < deadline);
     return null;
@@ -231,12 +283,13 @@ export class CommentBrowser {
         // 输入框里已有内容时判断它的来历：
         //   已发出评论的残留（抖音发布后不清空输入框）→ 可以清掉重写
         //   我们的收据里记过的旧文本 → 同样可以清掉
+        //   模板池里的句子 → 是我们自己抽的，发布中断时没来得及记收据，也可以清掉
         //   其他来历不明的文字 → 保留，不动用户的东西
         let existing = cleanDraft(await editor.evaluate(el => el.innerText));
         if (existing) {
           const known = new Set([...this.receipts().operations.map(item => cleanDraft(item.text)), text]);
-          const looksOurs = [...known].some(item => item && (item === existing || existing.includes(item) || item.includes(existing)));
-          if (!looksOurs) {
+          const knownHit = [...known].some(item => item && (item === existing || existing.includes(item) || item.includes(existing)));
+          if (!knownHit && !await looksLikeOurTemplate(existing)) {
             return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '评论输入框已有其他草稿，已保留原内容。' };
           }
           await clearEditor(page, editor);

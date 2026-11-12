@@ -14,7 +14,7 @@ window.__ModuleLoader__.load({
     const videoPolicyKey = policy => policy && JSON.stringify([Array.isArray(policy.windows) ? [...new Set(policy.windows)] : null, policy.weekendWindows || null, policy.sessionMinutes]);
     // 设置页只保留发指令代替不了的三项。其余配置（时段、时长、主题、评论、点赞、收藏）一律由 AI 用 douyin_config 改。
     // 人格保留：它是身份核心，不应由 AI 静默改写。
-    const fallbackCategories = { '基础设置': ['DSH 模型', '人格与兴趣'], '观看日报': ['观看日报'], '自检与用量': ['自检与用量'] };
+    const fallbackCategories = { '基础设置': ['DSH 模型', '观看与评论', '人格与兴趣'], '观看日报': ['观看日报'], '自检与用量': ['自检与用量'] };
 
     const OPERATIONS = {
       '/bootstrap': '连接本机服务', '/state': '刷新运行状态', '/interactions/state': '读取好友在线状态', '/interactions/configure': '设置好友互动',
@@ -148,6 +148,22 @@ window.__ModuleLoader__.load({
       const positive = (value, label) => { const number = Number(value); if (String(value).trim() === '' || !Number.isSafeInteger(number) || number < 1) throw new Error(`${label}请填写正整数。`); return number; };
       const model = useAutosave({ value: state?.model, initial: { provider: '', model: '' }, read: value => ({ provider: value.provider || '', model: value.model || '' }), encode: value => { if (!value.provider || !value.model) throw new Error('请选择提供商和模型。'); return value; }, write: write('/model/configure'), available: ready && !operationActive });
       const persona = useAutosave({ value: state?.persona, initial: { content: '', expectedRevision: null }, read: value => ({ content: value.manualText || '', expectedRevision: value.revision }), encode: value => value, write: write('/persona/configure'), canonical: (saved, payload) => saved?.revision ? { content: saved.manualText || '', expectedRevision: saved.revision } : payload, available: ready && !operationActive });
+      // 观看时长/次数：空输入 = 不限（null），数字 = 限制；时段用逗号分隔的 "开始-结束"。
+      const videoForm = useAutosave({
+        value: state?.video?.policy, initial: { enabled: false, windows: '00:00-24:00', dailyMinutes: '', dailyRequests: '' },
+        read: value => ({ enabled: value?.enabled === true, windows: Array.isArray(value?.windows) && value.windows.length ? value.windows.join(', ') : '00:00-24:00', dailyMinutes: value?.dailyMinutes == null ? '' : String(value.dailyMinutes), dailyRequests: value?.dailyRequests == null ? '' : String(value.dailyRequests) }),
+        encode: value => {
+          const windows = value.windows.split(/[,\n;，；]+/).map(item => item.trim()).filter(Boolean);
+          if (!windows.length) throw new Error('请至少填写一个观看时段，例如 00:00-24:00。');
+          const limit = (raw, label) => { const text = String(raw).trim(); if (!text) return null; const number = Number(text); if (!Number.isSafeInteger(number) || number < 1) throw new Error(`${label}请填正整数，或留空表示不限。`); return number; };
+          return { enabled: value.enabled, windows, dailyMinutes: limit(value.dailyMinutes, '每日观看分钟'), dailyRequests: limit(value.dailyRequests, '每日请求次数') };
+        },
+        write: write('/video/configure'), available: ready && !operationActive });
+      const commentForm = useAutosave({
+        value: state?.comments, initial: { enabled: true, dailyLimit: 50, perSessionLimit: 20 },
+        read: value => ({ enabled: value?.enabled === true, dailyLimit: String(value?.dailyLimit ?? 50), perSessionLimit: String(value?.perSessionLimit ?? 20) }),
+        encode: value => ({ enabled: value.enabled, dailyLimit: positive(value.dailyLimit, '每日评论次数'), perSessionLimit: positive(value.perSessionLimit, '每次观看评论次数') }),
+        write: write('/comments/configure'), available: ready && !operationActive });
       async function perform(key, action) {
         if (!ready || locks.current.has(key)) return; locks.current.add(key); setBusy(new Set(locks.current)); setNotice('');
         setOperationErrors(old => { const next = { ...old }; delete next[key]; return next; });
@@ -174,6 +190,16 @@ window.__ModuleLoader__.load({
         h('div', { role: 'tablist', 'aria-label': '抖音设置分类', style: row }, ...Object.keys(fallbackCategories).map(name => h(Button, { key: name, role: 'tab', type: 'button', size: 'sm', variant: category === name ? 'primary' : 'outline', 'aria-selected': category === name, onClick: () => setCategory(name) }, name))),
         category === '基础设置' && h('div', null,
           section('DSH 模型', select('模型提供商', model.draft.provider, [['', '请选择 DSH 提供商'], ...(state?.model?.providers || []).map(item => [item.id, item.name || item.id])], provider => model.edit({ provider, model: '' }, { immediate: true }), operationActive), select('模型名称', model.draft.model, [['', '请选择模型'], ...(state?.model?.models || []).filter(item => item.provider === model.draft.provider).map(item => [item.id, item.name || item.id])], value => model.edit({ model: value }, { immediate: true }), operationActive), status(model), note(state?.model?.configured ? '模型已配置。' : '请选择已配置的 DSH 模型。')),
+          section('观看与评论',
+            toggle('允许观看视频', videoForm.draft.enabled, value => videoForm.edit({ enabled: value }, { immediate: true }), operationActive),
+            field('观看时段（逗号分隔，如 00:00-24:00）', videoForm, 'windows', { blurOnly: true, onBlur: () => { void videoForm.flush(); } }),
+            field('每日观看时长（分钟，留空不限）', videoForm, 'dailyMinutes', { blurOnly: true, onBlur: () => { void videoForm.flush(); } }),
+            field('每日模型请求次数（留空不限）', videoForm, 'dailyRequests', { blurOnly: true, onBlur: () => { void videoForm.flush(); } }),
+            status(videoForm), note(`今日已看 ${Math.round((state?.video?.daily?.usedSeconds || 0) / 60)} 分钟 · 模型请求 ${state?.video?.daily?.requests || 0} 次`),
+            toggle('允许发表公开评论', commentForm.draft.enabled, value => commentForm.edit({ enabled: value }, { immediate: true }), operationActive),
+            field('每日评论次数上限（1-50）', commentForm, 'dailyLimit', { blurOnly: true, onBlur: () => { void commentForm.flush(); } }),
+            field('每次观看评论次数上限（1-20）', commentForm, 'perSessionLimit', { blurOnly: true, onBlur: () => { void commentForm.flush(); } }),
+            status(commentForm), note('修改后自动保存；评论开关在有待核对记录时会拒绝保存。')),
           section('人格与兴趣', area('大肥鱼人格正文', persona, 'content', 14, true, operationActive), status(persona), persona.status.kind === 'error' && button('载入最新人格（替换草稿）', 'personaReload', () => { void perform('personaReload', async () => { const latest = await refresh(true); if (!latest?.persona?.revision) throw new Error('未读到最新人格，原草稿已保留。'); persona.edit({ content: latest.persona.manualText || '', expectedRevision: latest.persona.revision }, { blurOnly: true }); return latest.persona; }); }), note('离开输入框后保存。插件与软件共用人格，未保存草稿不会被轮询覆盖。'), note(state?.persona?.personaFolder))),
         category === '观看日报' && section('观看日报', note(state?.reports?.folder), button('生成今天日报', 'reportGenerate', () => { void perform('reportGenerate', async () => { const value = await api.request('/reports/generate', {}); setReport(value); return value; }); }), h('label', { style: column }, '日报日期', h('input', { type: 'date', 'aria-label': '日报日期', style: formControl, value: reportDate, onChange: event => setReportDate(event.target.value) })), button('读取所选日报', 'reportRead', () => { void perform('reportRead', async () => { if (!/^\d{4}-\d{2}-\d{2}$/.test(reportDate)) throw new Error('请选择有效日期。'); const value = await api.request(`/reports/read?date=${reportDate}`); setReport(value); return value; }); }), report && h('pre', { 'aria-label': '日报内容', style: { whiteSpace: 'pre-wrap' } }, report.markdown || '暂无内容')),
         category === '自检与用量' && section('自检与用量', button('一键自检', 'diagnostics', () => { void perform('diagnostics', async () => { const value = await api.request('/diagnostics', {}); setDiagnostics(value); setRepairResult(''); return value; }); }), diagnostics && h('div', { style: column }, ...(diagnostics.checks || []).map(item => h('div', { key: item.id }, note(`${({ pass: '通过', warning: '待核对', fail: '未通过' })[item.status]} · ${item.label}：${item.message} [${item.code || ''}]`), ...(item.resolution?.steps || []).map(step => note(step)))), ...(diagnostics.repairableActions || []).map(action => button(`修复：${action.label}`, 'diagnostics', () => { void perform('diagnostics', async () => { const value = await api.request('/diagnostics/repair', { reportId: diagnostics.reportId, action: action.id }); setDiagnostics(value.after); setRepairResult(value.message); return value; }); })), note(repairResult), h('details', null, h('summary', null, '查看或复制诊断报告'), h('textarea', { 'aria-label': '诊断报告', readOnly: true, rows: 12, style: formControl, value: JSON.stringify(diagnostics, null, 2) }))), h('h3', null, '今日用量'), note(`模型响应 ${state?.usage?.today?.requests || 0} 次 · 已报告 ${state?.usage?.today?.totalTokens || 0} Token`), note(`输入 ${state?.usage?.today?.promptTokens || 0} · 输出 ${state?.usage?.today?.completionTokens || 0} · 缓存命中 ${state?.usage?.today?.cacheReportedRequests ? state.usage.today.cachedTokens : '未报告'} · 用量未知 ${state?.usage?.today?.unknownRequests || 0} 次`), state?.usage?.inFlight > 0 && note(`请求中 ${state.usage.inFlight} 次，Token 等模型返回后记录。`), ...(state?.usage?.groups || []).map(item => note(`${item.model} · ${item.requests} 次响应 · ${item.totalTokens} Token`)), note(state?.usage?.note))

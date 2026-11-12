@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ApiAgent, redact, watchDecisionMessages, parseWatchDecision } from './api-agent.mjs?v=13';
+import { ApiAgent, redact, watchDecisionMessages, parseWatchDecision } from './api-agent.mjs?v=20';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
 import { AutonomousShare, isSharePreflightNotSent } from './autonomous-share.mjs?v=9';
 import { AutonomousComments } from './autonomous-comments.mjs?v=9';
@@ -15,12 +15,14 @@ import { DailyReport } from './daily-report.mjs?v=9';
 import { WatchOptions } from './watch-options.mjs';
 import { UsageLedger } from './usage-ledger.mjs';
 
-export const WATCH_LIMITS = Object.freeze({ sampleSeconds: 3, maxLiveSkips: 3 });
+export const WATCH_LIMITS = Object.freeze({ sampleSeconds: 3, maxLiveSkips: 3, maxSwitchFailures: 5 });
 // 评论这一步没发出去不结束观看；连续多次修不好才停用本轮评论。
 export const COMMENT_LIMITS = Object.freeze({ maxConsecutiveSkips: 3 });
 const alive = pid => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 const read = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw new Error('自主观看状态文件损坏，未重置预算或运行锁。'); } };
-const write = (file, value) => { const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`; try { fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600, flag: 'wx' }); fs.renameSync(temporary, file); } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } };
+// 原子写统一走公共模块。原来这里有一份本地实现，没有重试和互斥；
+// watch-loop.lock 就是用那份写的，EPERM 一来整轮观看直接死掉。
+import { writeJson as write } from './atomic-write.mjs';
 const day = now => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(now));
 const failure = (message, watchStatus = 'failed') => Object.assign(new Error(message), { watchStatus });
 export function readShareProgress(value) {
@@ -97,16 +99,48 @@ export class AutonomousWatch {
     const ownRun = this.running && worker?.owned && worker.sessionId === this.sessionId && worker.source === this.source;
     return redact({ protocol: 'autonomous-watch-v1', running: Boolean(worker?.alive), owned: Boolean(worker?.owned), worker, status: stopping ? 'stopping' : worker?.alive ? 'running' : ['running', 'stopping'].includes(selectedSaved.status) ? 'stopped' : selectedSaved.status || 'stopped', sessionId, counts: { ...counts, maxRequests:null, dailyRequests: time.daily?.requests ?? budget.days[day(this.now())] ?? 0, dailyLimit: time.policy.dailyRequests ?? null }, phase: ownRun ? this.phase || 'waiting' : savedRunMatches ? selectedSaved.phase || 'waiting' : 'idle', pendingRequests: ownRun ? this.pendingRequests || 0 : savedRunMatches && selectedSaved.pendingRequests === 1 ? 1 : 0, shareProgress: ownRun ? this.shareProgress || null : savedRunMatches ? readShareProgress(selectedSaved.shareProgress) : null, options: this.optionsService.state().policy, lastDecision: selectedSaved.lastDecision || null, lastError: selectedSaved.lastError || '', lastSwitchDiagnostic: readSwitchDiagnostic(selectedSaved.lastSwitchDiagnostic), remainingSeconds: time.allowed && time.session?.id === sessionId ? time.remainingSeconds : 0 }, [this.config.apiKey]);
   }
-  save(value) { write(this.files.state, redact({ ...read(this.files.state, {}), ...value, source: this.source, sessionId: this.sessionId, runId:this.runId, updatedAt: new Date(this.now()).toISOString() }, [this.config.apiKey])); }
+  // 落盘是「记录」不是「决策」：写不进去只丢一次状态快照，绝不能因此终止整轮观看。
+  // 这个函数在观看循环里每轮被调用五六次，是整条链上最频繁的写，也是之前 EPERM 打死循环的地方。
+  save(value) {
+    try {
+      write(this.files.state, redact({ ...read(this.files.state, {}), ...value, source: this.source, sessionId: this.sessionId, runId:this.runId, updatedAt: new Date(this.now()).toISOString() }, [this.config.apiKey]));
+      this.saveFailures = 0;
+    } catch (error) {
+      this.saveFailures = (this.saveFailures || 0) + 1;
+      // 只在第一次和每二十次报告，避免刷屏；继续观看。
+      if (this.saveFailures === 1 || this.saveFailures % 20 === 0) {
+        try { this.onEvent({ type: 'watch.state-save-skipped', reason: error?.message || String(error), failures: this.saveFailures }); } catch {}
+      }
+    }
+  }
   assertAllowed() {
     this.abort?.signal.throwIfAborted();
     const worker = this.worker(); if (!worker?.owned) throw failure('自主观看已失去运行锁，停止操作。');
-    const time = this.videoLimits.state();
+    // state() 内部会落盘累计用量。落盘失败是统计问题，不能让观看停摆；
+    // 但读取/校验失败（账本损坏）是真的状态不明，仍然要停。
+    let time;
+    try { time = this.videoLimits.state(); }
+    catch (error) {
+      if (['EPERM','EBUSY','EACCES','EWRITELOCK'].includes(error.code)) {
+        this.onEvent({ type: 'watch.ledger-skipped', reason: error?.message || String(error) });
+        return null;
+      }
+      throw error;
+    }
     if ((!time.allowed && !(this.pendingRequests===1 && time.reasonCode==='daily-requests')) || time.session?.id !== this.sessionId || time.session?.status!=='active') throw failure(time.reason || '内部观看运行已结束或改变，原自主观看已停止。', 'limited');
     return time;
   }
   reserveRequest() {
-    return this.control(() => {this.assertAllowed();return this.videoLimits.reserveRequest({sessionId:this.sessionId,source:this.source}).requests;});
+    // 请求计数只是统计，写不进去不影响能不能继续看。
+    try {
+      return this.control(() => {this.assertAllowed();return this.videoLimits.reserveRequest({sessionId:this.sessionId,source:this.source}).requests;});
+    } catch (error) {
+      if (['EPERM','EBUSY','EACCES','EWRITELOCK'].includes(error.code)) {
+        this.onEvent({ type: 'watch.ledger-skipped', reason: error?.message || String(error) });
+        return null;
+      }
+      throw error;
+    }
   }
   claimManual(kind) {
     const token = randomUUID();
@@ -142,6 +176,17 @@ export class AutonomousWatch {
       write(this.files.lock, { version: 1, pid: process.pid, runId: this.runId, sessionId: this.sessionId, source: this.source, status: 'running', heartbeatAt: this.now() });
     });
     this.abort = new AbortController(); this.running = true; this.playbackClosed=false;this.phase='waiting';this.pendingRequests=0;this.startedDate = day(this.now());
+    // 评论独立于观看循环运行。
+    // 观看会因为模型超时、换片失败、页面异常等各种原因终止，评论挂在它上面就等于继承所有故障——
+    // 之前四轮全都是这个原因：评论一次没触发，因为观看先死了。
+    // 现在给评论单独的定时器，只要这一轮还活着就按点发，不关心模型和换片结果。
+    try { this.startCommentTimer(); }
+    catch (error) {
+      // 定时器起不来不该让整轮起不来：清掉已写入的锁和会话，把错误原样抛出。
+      this.running = false;
+      try { this.control(() => { if (this.worker()?.runId === this.runId) fs.unlinkSync(this.files.lock); }); } catch {}
+      throw error;
+    }
     try {
     this.save({ status: 'running', phase:'waiting',pendingRequests:0,lastError: '', lastDecision: null });
     this.heartbeat = setInterval(() => {
@@ -177,7 +222,10 @@ export class AutonomousWatch {
     if (output?.changed !== true) this.recordSwitchFailure(name,output,{startedAt,expectedVideoId});
     this.assertAllowed();
     const state = output?.state || output;
-    this.videoLimits.notePlayback?.(this.source,state,{ownerId:this.runId});
+    // 账本写不进去是「统计丢了」，不是「该停止观看」。原来这里不捕获，
+    // 一次 EPERM 就能把整轮观看打死——评论、点赞全都跟着没机会跑。
+    try { this.videoLimits.notePlayback?.(this.source,state,{ownerId:this.runId}); }
+    catch (error) { this.onEvent({ type: 'watch.ledger-skipped', reason: error?.message || String(error) }); }
     if (state?.loginRequired || state?.verificationRequired || state?.blocked || state?.privateChatVisible || state?.unsupportedPage) throw failure('抖音页面需要手动处理，已停止自主观看。', 'needs_user');
     this.onEvent(redact({ type: 'watch.tool', tool: name, result: output }, [this.config.apiKey]));
     return output;
@@ -271,32 +319,111 @@ export class AutonomousWatch {
     this.commentPaused = true;
     this.onEvent({ type: 'watch.comment-paused', reason, message: `评论连续 ${this.commentSkipStreak} 次没有发出去，本轮不再尝试评论；观看继续。` });
   }
-  // 模板评论：正文本地抽、频度本地控，不调用模型。
-  async publishTemplatedComment({ evidenceId, videoId, observedState, freshState }) {
+  // 读回当前是否在播。取不到就返回 null，让调用方按「未知」处理而不是瞎猜。
+  async isPlaying() {
+    try {
+      const now = await this.execute('douyin_status');
+      const paused = (now.state || now).video?.paused;
+      return typeof paused === 'boolean' ? !paused : null;
+    } catch { return null; }
+  }
+  // 确保视频在播。这是切换和观看的前提：暂停状态下滚轮切换不生效。
+  // 最多试三次，每次读回确认，避免「发了播放命令但没生效」。
+  async ensurePlaying({ attempts = 3 } = {}) {
+    for (let i = 0; i < attempts; i++) {
+      const playing = await this.isPlaying();
+      if (playing === true) return true;
+      try { await this.execute('douyin_play'); }
+      catch (error) { this.onEvent({ type: 'watch.play-failed', attempt: i + 1, reason: error?.message || String(error) }); }
+      await this.delayImpl(300 + i * 400, this.abort.signal);
+    }
+    const final = await this.isPlaying();
+    if (final !== true) this.onEvent({ type: 'watch.play-unconfirmed', message: '视频没能恢复播放，后续换片可能失效。' });
+    return final === true;
+  }
+  // 独立的评论定时器：按 config.comment.everySeconds 的节奏自己跑，
+  // 不依赖观看循环走到哪一步，也不受模型、换片、超时影响。
+  // 首次立即触发一次，之后按间隔。出错只记录，不抛出——它垮了也不能连累观看。
+  startCommentTimer() {
+    this.stopCommentTimer();
+    const everySeconds = this.getAgentConfig().get().comment?.everySeconds ?? 180;
+    const tick = async () => {
+      if (!this.running || this.abort?.signal.aborted) return;
+      if (this.commentTimerBusy) return;
+      this.commentTimerBusy = true;
+      try {
+        // 自己读当前作品，不依赖观看循环的变量。拿不到就等下一拍。
+        const now = await this.execute('douyin_status');
+        const state = now.state || now;
+        const videoId = state.video?.id;
+        if (!videoId) return;
+        const evidenceId = this.personaMemory.snapshot?.()?.recentObservations?.find(item => item.videoId === videoId)?.id;
+        await this.tryTimedComment({ evidenceId, videoId, observedState: state });
+      } catch (error) {
+        try { this.onEvent({ type: 'watch.comment-timer-error', reason: error?.message || String(error) }); } catch {}
+      } finally {
+        this.commentTimerBusy = false;
+      }
+    };
+    // 首次立即跑一次（tryTimedComment 自己判断 lastCommentAt，首次会直接评论）。
+    void tick();
+    this.commentTimer = setInterval(() => { void tick(); }, Math.max(30, Math.min(3600, everySeconds)) * 1000);
+    this.commentTimer.unref?.();
+    return this.commentTimer;
+  }
+  stopCommentTimer() {
+    if (this.commentTimer) { clearInterval(this.commentTimer); this.commentTimer = null; }
+    this.commentTimerBusy = false;
+  }
+  // 定时评论：唯一条件是「距上次评论够久了」。不看模型意见，不看播放进度，不看作答资格。
+  // 评论前暂停视频让输入框稳定；结束后必须恢复播放，否则下一次换片会因暂停而失效。
+  async tryTimedComment({ evidenceId, videoId, observedState }) {
+    if (this.commentPaused) return null;
+    const config = this.getAgentConfig().get();
+    if (config.comment?.enabled === false) return null;
+    const everySeconds = config.comment?.everySeconds ?? 180;   // 默认三分钟一条
+    const lastAt = this.lastCommentAt || 0;
+    const waited = (this.now() - lastAt) / 1000;
+    if (lastAt && waited < everySeconds) return null;
+
+    let pausedByUs = false;
+    try {
+      const now = await this.execute('douyin_status');
+      if ((now.state || now).video?.id !== videoId) return null;
+      if ((now.state || now).video?.paused === false) {
+        await this.execute('douyin_pause');
+        pausedByUs = true;
+        this.onEvent({ type: 'watch.comment-paused-video', videoId, message: '评论前暂停视频。' });
+      }
+      const delivery = await this.publishTemplatedComment({ evidenceId, videoId, freshState: now.state || now });
+      this.lastCommentAt = this.now();
+      return delivery;
+    } catch (error) {
+      // 评论是附加动作，失败只记一笔，绝不中断观看。
+      this.onEvent({ type: 'watch.comment-failed', videoId, reason: error?.message || String(error) });
+      return null;
+    } finally {
+      // 不管评论成功、失败还是抛错，只要是我们暂停的，就必须播回去。
+      // 没播回去的后果不是「少看几秒」，而是下一次滚轮换片整个失效，整轮观看就此死掉。
+      if (pausedByUs) {
+        const resumed = await this.ensurePlaying();
+        this.onEvent(resumed
+          ? { type: 'watch.comment-resumed-video', videoId }
+          : { type: 'watch.comment-resume-failed', videoId, message: '评论后没能恢复播放，已多次重试。' });
+      }
+    }
+  }
+  // 模板评论：正文本地抽，完全不调用模型，也不做「够不够格」的判定。
+  // 时机由程序的定时器决定（watch.commentEverySeconds），这里只负责发出去。
+  async publishTemplatedComment({ evidenceId, videoId, freshState }) {
     if (freshState?.video?.id !== videoId) { this.recordCommentSkip(videoId, '评论前作品已变化。'); return null; }
     const gate = this.getGate();
     if (this.commentPaused) return null;
-    // 依据是真实播放进度与停留，不是模型自称；观察只采样数秒，进度比例不单独当门槛。
-    const worth = gate.worthEngaging({
-      watchRatio: this.watchRatio(observedState),
-      played: observedState?.video?.paused === false,
-      paused: observedState?.video?.paused === true,
-      stayed: this.stayedThisRound === true,
-    });
-    if (!worth.comment) {
-      this.onEvent({ type: 'watch.comment-skipped', videoId, reason: worth.reason, message: `这条没有达到评论门槛（${worth.reason}），跳过。` });
-      return null;
-    }
-    const allowed = gate.allowance('comment');
-    if (!allowed.allowed) {
-      this.onEvent({ type: 'watch.comment-deferred', videoId, reason: allowed.reason, waitSeconds: allowed.waitSeconds ?? null, message: `这一条先不评论：${allowed.reason}` });
-      return null;
-    }
     let text;
     try { text = gate.pickCommentText(); }
     catch (error) { this.recordCommentSkip(videoId, error.message); return null; }
     const delivery = await this.publishComment({ evidenceId, videoId, text });
-    if (delivery) gate.record('comment');
+    if (delivery) this.safeRecord('comment');
     return delivery;
   }
   // 点赞/收藏：本地闸门决定要不要点，浏览器只负责点一次并核对结果。
@@ -310,8 +437,10 @@ export class AutonomousWatch {
     }
     let result;
     try {
-      // currentVideo 会等到页面锁定唯一可见的 <video>，拿到它再点，避免点到别的卡片。
-      result = await toggleInteraction(await this.controller.currentVideo(), action);
+      // 用完整 Page 执行互动：currentVideo() 返回的 Locator 在其隔离执行环境里读不到
+      // 视口几何（实测 readInPage 经 Locator evaluate 返回 total:0），导致永远「找不到按钮」。
+      // toggleInteraction 自己按视口筛选唯一可见按钮，Page 级别执行即可。
+      result = await this.controller.withPage(page => toggleInteraction(page, action), { signal: this.abort.signal, launch: false, create: false });
     } catch (error) {
       // 点击前的读取或点击本身失败都按跳过处理，不中断观看。
       this.onEvent({ type: `watch.${action}-skipped`, reason: error?.message || String(error) });
@@ -320,12 +449,17 @@ export class AutonomousWatch {
     if (result.changed !== true) {
       this.onEvent({ type: `watch.${action}-skipped`, reason: result.reason, already: result.already === true });
       // 本来就选中了：说明这条之前已经点过，不该再试着点它；记一次额度占用相当于把它划掉。
-      if (result.already === true) { gate.record(`${action}:noop`); }
+      if (result.already === true) { this.safeRecord(`${action}:noop`); }
       return null;
     }
-    gate.record(action);
+    this.safeRecord(action);
     this.onEvent({ type: `watch.${action}`, action, reason: result.reason });
     return result;
+  }
+  // 互动账本同样是「统计」：写不进去不影响刚才那次点赞/收藏本身已经成功。
+  safeRecord(action) {
+    try { this.getGate().record(action); }
+    catch (error) { this.onEvent({ type: 'watch.ledger-skipped', action, reason: error?.message || String(error) }); }
   }
   // 播放进度占时长的比例；取不到可信值就返回 0，让互动判定拒绝而不是瞎猜。
   watchRatio(state) {
@@ -390,12 +524,18 @@ export class AutonomousWatch {
   }
   async run() {
     let status = 'stopped', lastError = '';
-    this.liveSkipStreak = 0;this.invalidDecisionStreak=0;this.shareProgress=null;this.commentSkipStreak=0;this.commentPaused=false;this.stayedThisRound=false;
+    this.liveSkipStreak = 0;this.invalidDecisionStreak=0;this.shareProgress=null;this.commentSkipStreak=0;this.commentPaused=false;this.stayedThisRound=false;this.switchFailStreak=0;
     try { this.getGate().newRound(); } catch { /* 闸门初始化失败不阻断观看。 */ }
     try {
       this.save({shareProgress:null,decisionRetry:null});
       let current = await this.execute('douyin_status');
-      if (!(current.state || current).video?.id && !isLivePreview(current.state || current)) current = await this.execute('douyin_open');
+      // 启动阶段的页面加载也是瞬态：douyin_open 的 settle 等 30 秒还没就绪时重试几次，
+      // 不让「推荐流尚未读到就绪视频」杀掉整轮。
+      for (let attempt = 0; !(current.state || current).video?.id && !isLivePreview(current.state || current); attempt++) {
+        if (attempt >= 4) throw failure('连续多次无法读取到推荐流就绪视频，请人工查看页面。', 'needs_user');
+        try { current = await this.execute('douyin_open'); }
+        catch (error) { this.onEvent({ type: 'watch.switch-skipped', reasonCode: 'open-not-ready', attempt, message: `推荐流还没就绪（${error.message}），重试。` }); await this.delayImpl(3000 + attempt * 2000, this.abort.signal); }
+      }
       const initialOptions = this.optionsService.state().policy;
       if (initialOptions.mode === 'topic') {
         current = await this.execute('douyin_search', { query: initialOptions.topics[0] });
@@ -407,23 +547,58 @@ export class AutonomousWatch {
         this.assertAllowed();
         const options=this.optionsService.state().policy;
         current = await this.skipLivePreviews(current);
-        if ((current.state || current).video?.paused !== false) current = await this.execute('douyin_play');
+        // 循环开头强制确认在播：暂停状态下滑轮换片不生效，会连锁导致 switch-input-unconfirmed。
+        if ((current.state || current).video?.paused !== false) { await this.ensurePlaying(); current = await this.execute('douyin_status'); }
         if (isLivePreview(current.state || current)) continue;
         const sampleStartedAt = this.now();
         this.phase='observing';this.save({phase:this.phase,pendingRequests:0});
         let observation = await this.execute('douyin_observe', { seconds: WATCH_LIMITS.sampleSeconds });
-        const observedAt = this.now(), observedState = observation.state || observation;
+        // 换片后页面常处于加载态，采样读不到视频 id（或帧与作品不一致）是正常瞬态，
+        // 不该终止整轮：等一下重新采样即可。连续多次采不到才按换片失败处理。
+        const observedAt = this.now();
+        const observedState = observation.state || observation;
         if (isLivePreview(observedState)) { current = observation; continue; }
-        watchDecisionMessages(observation);
+        if (!/^\d{10,30}$/.test(observedState?.video?.id || '') || observation.observation?.videoId && observation.observation.videoId !== observedState?.video?.id) {
+          this.onEvent({ type: 'watch.switch-skipped', reasonCode: 'sample-not-ready', consecutive: (this.switchFailStreak = (this.switchFailStreak || 0) + 1), message: '作品还在加载，画面没采到，稍等重采。' });
+          if (this.switchFailStreak >= WATCH_LIMITS.maxSwitchFailures) throw failure('连续多次无法采样到有效作品画面，已停止自主观看，请人工查看页面。', 'needs_user');
+          await this.ensurePlaying();
+          await this.delayImpl(2000 + Math.random() * 3000, this.abort.signal);
+          continue;
+        }
+        try { watchDecisionMessages(observation); } catch (error) {
+          this.onEvent({ type: 'watch.switch-skipped', reasonCode: 'sample-mismatch', consecutive: (this.switchFailStreak = (this.switchFailStreak || 0) + 1), message: `采样核对没通过（${error.message}），稍等重采。` });
+          if (this.switchFailStreak >= WATCH_LIMITS.maxSwitchFailures) throw failure('连续多次采样核对失败，已停止自主观看，请人工查看页面。', 'needs_user');
+          await this.ensurePlaying();
+          await this.delayImpl(2000 + Math.random() * 3000, this.abort.signal);
+          continue;
+        }
+        this.switchFailStreak = 0;
         this.liveSkipStreak = 0;
         const title = String(observedState.video?.title || '');
         if (options.exclude.some(word => title.toLocaleLowerCase().includes(word.toLocaleLowerCase()))) { current = await this.execute('douyin_next'); continue; }
         const evidenceId = observation.personaEvidenceId || observation.state?.personaEvidenceId || this.personaMemory.recordObservation(observation, { source: this.source, kind: 'visual' }).evidenceId;
         let viewing = observation.viewing;
+        // 学习/评论全是「锦上添花」步骤：页面瞬态（换片加载中等）导致校验不过时，
+        // 只丢这一步的学习，不终止整轮。它们的 throw 原先落在动作兜底之外，是最后一处杀整轮的路径。
         if (viewing) {
-          if (viewing.evidenceId !== evidenceId || viewing.videoId !== observedState.video.id || typeof viewing.sampleId !== 'string' || typeof viewing.accepted !== 'boolean') throw failure('本次观看回执与作品观察不一致，没有写入兴趣。');
-        } else viewing = this.viewing(evidenceId, current, observation, sampleStartedAt, `watch:${this.runId}:observe:${randomUUID()}`);
+          if (viewing.evidenceId !== evidenceId || viewing.videoId !== observedState.video.id || typeof viewing.sampleId !== 'string' || typeof viewing.accepted !== 'boolean') {
+            this.onEvent({ type: 'watch.learning_skipped', message: '观看回执与作品观察不一致，本次没有写入兴趣。' });
+            viewing = null;
+          }
+        } else {
+          try { viewing = this.viewing(evidenceId, current, observation, sampleStartedAt, `watch:${this.runId}:observe:${randomUUID()}`); }
+          catch (error) {
+            if (!['PERSONA_EVIDENCE', 'PERSONA_ARGUMENT'].includes(error.code)) throw error;
+            this.onEvent({ type: 'watch.learning_skipped', message: `作品状态暂不可用于学习（${error.message}），本次没有写入兴趣。` });
+            viewing = null;
+          }
+        }
         observation = { ...observation, ...(viewing ? { viewing } : {}) };
+        // 定时评论：由程序按时间触发，完全不经过模型，也不看任何「资格」判定。
+        // 模型永远倾向选 stay（视频没看完就继续看），指望它主动评论等于永远不评论。
+        // 这里只做时间判断：距上一次评论够久了就发一条，然后照常让模型决定怎么看着。
+        try { await this.tryTimedComment({ evidenceId, videoId: observedState.video.id, observedState }); }
+        catch (error) { this.onEvent({ type: 'watch.comment-error', message: `定时评论这一拍没执行（${error.message}），下拍再试。` }); }
         const shareContext = this.shareContext(observedState.video.id), commentContext = this.commentContext();
         const visualCheck = commentContext.visualCheck !== false;
         const processedRecipients = Array.isArray(shareContext.processedRecipients) ? shareContext.processedRecipients.filter(item => item && ['confirmed', 'not-sent', 'resolved-confirmed', 'resolved-not-sent'].includes(item.status) && shareContext.recipients?.some(recipient => recipient.id === item.recipientId)).map(({ recipientId, status }) => ({ recipientId, status })) : [];
@@ -461,8 +636,14 @@ export class AutonomousWatch {
         this.save({ lastDecision: decision, usage: result.usage }); this.onEvent({ type: 'watch.decision', decision, usage: result.usage });
         if (decision.action === 'stop') break;
         let learned = false;
+        // 单步执行整体兜底：任何一个动作（换片/搜索/停留/点赞/评论/分享）内部核对失败，
+        // 只跳过这一步继续跑，不让个别失败终止整轮。连续 5 步都失败才真正停止。
+        try {
         if (decision.action === 'skip') {
           const switchStartedAt = this.now();
+          // 换片前必须确认在播：暂停状态下滚轮/点击切换事件不会被页面接收，
+          // 表现就是 switch-input-unconfirmed，而那不是模型问题，是页面根本没在播。
+          await this.ensurePlaying();
           current = await this.execute('douyin_next', {}, { expectedVideoId: observedState.video.id });
           if (current?.staleObservation || current?.reasonCode === 'observed-video-changed') {
             const latest = current.state;
@@ -474,14 +655,49 @@ export class AutonomousWatch {
           if (current.changed === false || !readyVideo(current.state || current) || (current.state || current).video.id === observedState.video.id) {
             const reasonCode = current.reasonCode || (!readyVideo(current.state || current) ? 'autonomous-switch-not-ready' : (current.state || current).video.id === observedState.video.id ? 'autonomous-switch-same-id' : 'autonomous-switch-changed-false');
             this.recordSwitchFailure('douyin_next',{...current,before:current.before||observedState.video,reasonCode},{startedAt:switchStartedAt,expectedVideoId:observedState.video.id,stage:'autonomous-verification'});
-            throw failure('未确认切换到另一条就绪作品，已停止自主观看。');
+            // 换片失败不该杀死整轮：无人值守时停摆比多看一眼同一条更糟。
+            // 连续失败太多才停，避免在原地打转烧请求。
+            this.switchFailStreak = (this.switchFailStreak || 0) + 1;
+            this.onEvent({ type: 'watch.switch-skipped', reasonCode, consecutive: this.switchFailStreak, message: `这次换片没成功（${reasonCode}），继续看当前这条。` });
+            if (this.switchFailStreak >= WATCH_LIMITS.maxSwitchFailures) throw failure('连续多次无法切换作品，已停止自主观看，请人工查看页面。', 'needs_user');
+            // 确保当前这条还在播，然后重新观察。换片失败最常见的原因就是没在播。
+            await this.ensurePlaying();
+            await this.delayImpl(2000 + Math.random() * 3000, this.abort.signal);
+            continue;
           }
+          this.switchFailStreak = 0;
           if (gapTrusted && (viewing?.accepted === true || waited?.accepted === true)) learned = this.behavior(evidenceId, 'skip')?.accepted === true;
         } else if (decision.action === 'search') {
-          const found = await this.execute('douyin_search', { query: decision.query });
+          // 搜索换片和滚轮换片一样不致命：页面加载慢/结果点不开就跳过这轮，别杀死整轮。
+          let found = null;
+          try {
+            found = await this.execute('douyin_search', { query: decision.query });
+          } catch (error) {
+            this.onEvent({ type: 'watch.switch-skipped', reasonCode: 'search-not-ready', consecutive: (this.switchFailStreak = (this.switchFailStreak || 0) + 1), message: `搜索没完成（${error.message}），继续看当前这条。` });
+            if (this.switchFailStreak >= WATCH_LIMITS.maxSwitchFailures) throw failure('连续多次搜索/切换失败，已停止自主观看，请人工查看页面。', 'needs_user');
+            await this.ensurePlaying();
+            await this.delayImpl(2000 + Math.random() * 3000, this.abort.signal);
+            continue;
+          }
           const first = (found.state || found).searchResults?.find(item => Number.isSafeInteger(item.index) && item.index >= 0);
-          if (!first) throw failure('搜索没有返回可核对的作品，已停止自主观看。');
-          current = await this.execute('douyin_open_video', { index: first.index });
+          if (!first) {
+            this.onEvent({ type: 'watch.switch-skipped', reasonCode: 'search-no-results', consecutive: (this.switchFailStreak = (this.switchFailStreak || 0) + 1), message: '搜索没有返回可核对的作品，继续看当前这条。' });
+            if (this.switchFailStreak >= WATCH_LIMITS.maxSwitchFailures) throw failure('连续多次搜索/切换失败，已停止自主观看，请人工查看页面。', 'needs_user');
+            await this.ensurePlaying();
+            await this.delayImpl(2000 + Math.random() * 3000, this.abort.signal);
+            continue;
+          }
+          try {
+            current = await this.execute('douyin_open_video', { index: first.index });
+          } catch (error) {
+            // open_video 失败（目标作品未加载完成等）：回推荐流继续，不终止整轮。
+            this.onEvent({ type: 'watch.switch-skipped', reasonCode: 'search-open-failed', consecutive: (this.switchFailStreak = (this.switchFailStreak || 0) + 1), message: `打开搜索结果没成功（${error.message}），继续看当前这条。` });
+            if (this.switchFailStreak >= WATCH_LIMITS.maxSwitchFailures) throw failure('连续多次搜索/切换失败，已停止自主观看，请人工查看页面。', 'needs_user');
+            await this.ensurePlaying();
+            await this.delayImpl(2000 + Math.random() * 3000, this.abort.signal);
+            continue;
+          }
+          this.switchFailStreak = 0;
         } else if (decision.action === 'comment') {
           // 正文不再调模型：本地抽模板、过频度闸门，省掉这一整次请求。
           await this.publishTemplatedComment({ evidenceId, videoId: observedState.video.id, observedState, freshState });
@@ -505,19 +721,33 @@ export class AutonomousWatch {
           this.phase='waiting';this.save({phase:this.phase,pendingRequests:0});await this.delayImpl(decision.seconds * 1000, this.abort.signal); this.assertAllowed();
           current = await this.execute('douyin_status');
           const afterState = current.state || current;
-          if (afterState.video?.id !== beforeState.video.id || afterState.video.paused !== false) throw failure('停留期间作品或播放状态已变化，已停止自主观看，没有学习本次停留。', 'needs_user');
+          // 只核对「还是同一条」。播放进度当然会前进——长视频上它一直在动，那不是异常。
+          // 原来把 paused 一起判，等于在长视频上一选 stay 就必然终止整轮，观看循环直接死掉，评论再没机会执行。
+          if (afterState.video?.id !== beforeState.video.id) throw failure('停留期间作品已变化，已停止自主观看，没有学习本次停留。', 'needs_user');
+          // 被暂停不是致命错误，恢复播放继续，不结束整轮。用 ensurePlaying 读回确认，不盲发一次命令。
+          if (afterState.video?.paused !== false) { await this.ensurePlaying(); current = await this.execute('douyin_status'); }
           const stayed = this.viewing(evidenceId, stayBefore, current, stayStartedAt, `watch:${this.runId}:stay-view:${randomUUID()}`);
           // 停留是这个作品被认真看过的正向证据，留给后续互动判定。
           if (stayed?.accepted === true) { this.stayedThisRound = true; learned = this.behavior(evidenceId, 'stay')?.accepted === true; }
         }
         if (learned && decision.topics.length) this.personaMemory.updateAgentInterests({ evidenceId, topics: decision.topics, reflection: decision.reflection }, { source: this.source });
         if (['share', 'comment'].includes(decision.action)) current = await this.execute('douyin_status');
+        } catch (stepError) {
+          // 单步兜底：动作内部的核对失败（回执不一致、状态变化等）只丢弃这一步，
+          // 恢复播放后重新观察继续跑；连续 5 步失败才停。
+          this.switchFailStreak = (this.switchFailStreak || 0) + 1;
+          this.onEvent({ type: 'watch.switch-skipped', reasonCode: 'step-failed', consecutive: this.switchFailStreak, message: `这一步没走完（${stepError.message}），跳过继续。` });
+          if (this.switchFailStreak >= WATCH_LIMITS.maxSwitchFailures) throw stepError;
+          try { await this.ensurePlaying(); current = await this.execute('douyin_status'); } catch {}
+          await this.delayImpl(2000 + Math.random() * 3000, this.abort.signal);
+          continue;
+        }
       }
     } catch (error) {
       const reason = this.abort?.signal.aborted ? this.abort.signal.reason || error : error;
       status = reason.watchStatus || 'failed'; lastError = redact(reason.message || String(reason), [this.config.apiKey]);
     } finally {
-      this.playbackClosed=true;this.pendingRequests=0;this.phase='idle';clearInterval(this.heartbeat); clearTimeout(this.deadline);
+      this.playbackClosed=true;this.pendingRequests=0;this.phase='idle';this.stopCommentTimer();clearInterval(this.heartbeat); clearTimeout(this.deadline);
       try{this.videoLimits.settleWatching?.(this.source,{ownerId:this.runId});}catch{}
       try { if (this.worker()?.owned) await this.controller.pauseForLimits?.(); } catch (error) { status = 'failed'; lastError ||= redact(error.message, [this.config.apiKey]); }
       try { for(let attempt=0;;attempt++){try{if(this.worker()?.owned&&this.videoLimits.state().session?.id===this.sessionId)this.videoLimits.endSession?.({explicit:true,reason:'本次自动观看已结束，今日用量继续保留。'});break;}catch(error){if(error.code!=='VIDEO_CONTROL_BUSY'||attempt>=100)throw error;await delay(20);}} } catch(error) {status='failed';lastError ||= redact(error.message,[this.config.apiKey]);}
@@ -541,8 +771,20 @@ export class AutonomousWatch {
   }
   async stop({ explicit = false } = {}) {
     if (!explicit) throw Object.assign(new Error('停止共享自主观看需要用户明确操作。'), { status: 403 });
+    this.stopCommentTimer();
     const worker = this.worker();
-    if (worker?.owned) { this.abort?.abort(failure('用户停止自主观看。', 'stopped')); await this.completion; if (!this.running && this.worker()?.owned) this.control(() => { if (this.worker()?.owned) fs.unlinkSync(this.files.lock); }); }
+    // stop 必须能把单例从「start 中途抛错」的毒化状态里救回来。
+    // 原来 running 只在 run() 的 finally 里重置，而 start() 在 178~201 之间抛错时 run() 根本没启动，
+    // 于是 running 永远是 true，后续 start() 全被守卫挡住，只能重启进程。
+    if (!this.completion) {
+      // run() 从未启动，说明这是一次中途失败的 start：直接收尾，不要 await 一个不存在的 promise。
+      this.running = false;
+      this.stopCommentTimer();
+      if (worker?.owned) this.control(() => { const current = this.worker(); if (current?.runId === worker.runId) fs.unlinkSync(this.files.lock); });
+      try { this.save({ status: 'stopped', phase: 'idle', pendingRequests: 0, lastError: '已清理启动失败的残留状态。' }); } catch {}
+      return this.state();
+    }
+    if (worker?.owned) { this.abort?.abort(failure('用户停止自主观看。', 'stopped')); await this.completion; this.running = false; if (!this.running && this.worker()?.owned) this.control(() => { if (this.worker()?.owned) fs.unlinkSync(this.files.lock); }); }
     else if (worker?.alive) this.control(() => { const current = this.worker(); if (current?.runId === worker.runId) write(this.files.stop, { runId: worker.runId, requestedAt: this.now() }); });
     else if (worker) this.control(() => { if (this.worker()?.runId === worker.runId) { fs.unlinkSync(this.files.lock); write(this.files.state, { status: 'stopped', runId: worker.runId, sessionId: worker.sessionId, source: worker.source, phase: 'idle', pendingRequests: 0, lastError: '已清理退出进程的残留锁，预算继续保留。' }); } });
     return this.state();

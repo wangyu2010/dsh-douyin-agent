@@ -1,5 +1,6 @@
 import { TOOL_DEFINITIONS, validateToolArguments } from './tool-definitions.mjs?v=18';
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
 import { createNativeWatchDecision } from './native-watch-decision.mjs';
@@ -192,10 +193,13 @@ export async function apply(ctx, config = {}) {
     return sharedPersona;
   }});
   const getWatch=async(exec,starting)=>{
-    if (!watchPromise) watchPromise=Promise.all([getController(),import('./autonomous-watch.mjs?v=18')]).then(async ([controller,{AutonomousWatch}])=>{
+    if (!watchPromise) watchPromise=Promise.all([getController(),import('./autonomous-watch.mjs?v=25')]).then(async ([controller,{AutonomousWatch}])=>{
       if(starting) sharedPersona.initialize({importLegacy:false});
       const route=exec.agent?.session?.requestHeader?.()?.config ?? exec.agent?.options ?? {};
-      return new AutonomousWatch({controller,videoLimits:controller.limits(),personaMemory:sharedPersona,commentService:await controller.getComments(),reportService:await controller.getReport(),source:'dsh',config:{apiKey:'',baseUrl:'https://api.deepseek.com',model:route.model||'deepseek-flash'},...(starting?{decisionProvider:createNativeWatchDecision({llm:optionalService(ctx,'llm'),attachments:optionalService(ctx,'attachments'),agent:exec.agent})}:{})});
+      return new AutonomousWatch({controller,videoLimits:controller.limits(),personaMemory:sharedPersona,commentService:await controller.getComments(),reportService:await controller.getReport(),source:'dsh',config:{apiKey:'',baseUrl:'https://api.deepseek.com',model:route.model||'deepseek-flash'},
+        // 事件落盘：评论为什么没发、换片为什么失败，都要有据可查。
+        onEvent: (event) => { try { fs.appendFileSync(path.join(resolveRuntimePaths().stateDir,'watch-events.jsonl'), JSON.stringify({ at: new Date().toISOString(), ...event })+'\n'); } catch {} },
+        ...(starting?{decisionProvider:createNativeWatchDecision({llm:optionalService(ctx,'llm'),attachments:optionalService(ctx,'attachments'),agent:exec.agent})}:{})});
     }).catch(error=>{watchPromise=undefined;throw error;});
     const watch=await watchPromise;
     if(starting) {

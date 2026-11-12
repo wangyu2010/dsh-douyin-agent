@@ -494,7 +494,7 @@ export class BrowserController {
   }
   store() { return this.memory ??= new MemoryStore(resolveRuntimePaths().memoryDbPath); }
   async observeSharedWork(input) {
-    const { AutonomousWatch } = await import('./autonomous-watch.mjs?v=10');
+    const { AutonomousWatch } = await import('./autonomous-watch.mjs?v=19');
     const release = await lock('chat-shared-video', input.signal, this.controlDirectory);
     try {
       return await observeChatSharedWork({ ...input, videoLimits: this.limits(),
@@ -521,7 +521,7 @@ export class BrowserController {
     return this.sparkPromise;
   }
   getCommenter() {
-    this.commenterPromise ??= import('./comment-browser.mjs?v=18').then(({ CommentBrowser }) => new CommentBrowser({ source: this.source === 'dsh' ? 'dsh' : 'api', videoLimits: this.limits(), stateDir: this.limits().stateDir })).catch(error => { this.commenterPromise = null; throw error; });
+    this.commenterPromise ??= import('./comment-browser.mjs?v=19').then(({ CommentBrowser }) => new CommentBrowser({ source: this.source === 'dsh' ? 'dsh' : 'api', videoLimits: this.limits(), stateDir: this.limits().stateDir })).catch(error => { this.commenterPromise = null; throw error; });
     return this.commenterPromise;
   }
   getComments() {
@@ -772,7 +772,7 @@ export class BrowserController {
       if (name==='douyin_recall') return this.store().recall({query:args.query??'',limit:args.limit??10});
       if (name==='douyin_persona_status') return this.getPersonaMemory().snapshot();
       if (name==='douyin_watch_status') {
-        const {AutonomousWatch}=await import('./autonomous-watch.mjs?v=10');
+        const {AutonomousWatch}=await import('./autonomous-watch.mjs?v=19');
         this.watchStatusReader??=new AutonomousWatch({controller:this,config:{},videoLimits:this.limits(),personaMemory:this.getPersonaMemory(),source:this.source==='dsh'?'dsh':'api',stateDir:this.limits().stateDir});
         return this.watchStatusReader.state();
       }
