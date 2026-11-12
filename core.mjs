@@ -494,7 +494,7 @@ export class BrowserController {
   }
   store() { return this.memory ??= new MemoryStore(resolveRuntimePaths().memoryDbPath); }
   async observeSharedWork(input) {
-    const { AutonomousWatch } = await import('./autonomous-watch.mjs?v=19');
+    const { AutonomousWatch } = await import('./autonomous-watch.mjs?v=20');
     const release = await lock('chat-shared-video', input.signal, this.controlDirectory);
     try {
       return await observeChatSharedWork({ ...input, videoLimits: this.limits(),
@@ -521,11 +521,11 @@ export class BrowserController {
     return this.sparkPromise;
   }
   getCommenter() {
-    this.commenterPromise ??= import('./comment-browser.mjs?v=19').then(({ CommentBrowser }) => new CommentBrowser({ source: this.source === 'dsh' ? 'dsh' : 'api', videoLimits: this.limits(), stateDir: this.limits().stateDir })).catch(error => { this.commenterPromise = null; throw error; });
+    this.commenterPromise ??= import('./comment-browser.mjs?v=22').then(({ CommentBrowser }) => new CommentBrowser({ source: this.source === 'dsh' ? 'dsh' : 'api', videoLimits: this.limits(), stateDir: this.limits().stateDir })).catch(error => { this.commenterPromise = null; throw error; });
     return this.commenterPromise;
   }
   getComments() {
-    this.commentsPromise ??= import('./autonomous-comments.mjs?v=10').then(({ AutonomousComments }) => new AutonomousComments({ controller: this, personaMemory: this.getPersonaMemory(), videoLimits: this.limits(), stateDir: this.limits().stateDir, source: this.source === 'dsh' ? 'dsh' : 'api' })).catch(error => { this.commentsPromise = null; throw error; });
+    this.commentsPromise ??= import('./autonomous-comments.mjs?v=11').then(({ AutonomousComments }) => new AutonomousComments({ controller: this, personaMemory: this.getPersonaMemory(), videoLimits: this.limits(), stateDir: this.limits().stateDir, source: this.source === 'dsh' ? 'dsh' : 'api' })).catch(error => { this.commentsPromise = null; throw error; });
     return this.commentsPromise;
   }
   getReport() {
@@ -772,7 +772,7 @@ export class BrowserController {
       if (name==='douyin_recall') return this.store().recall({query:args.query??'',limit:args.limit??10});
       if (name==='douyin_persona_status') return this.getPersonaMemory().snapshot();
       if (name==='douyin_watch_status') {
-        const {AutonomousWatch}=await import('./autonomous-watch.mjs?v=19');
+        const {AutonomousWatch}=await import('./autonomous-watch.mjs?v=20');
         this.watchStatusReader??=new AutonomousWatch({controller:this,config:{},videoLimits:this.limits(),personaMemory:this.getPersonaMemory(),source:this.source==='dsh'?'dsh':'api',stateDir:this.limits().stateDir});
         return this.watchStatusReader.state();
       }

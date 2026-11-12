@@ -160,6 +160,24 @@ export class CommentBrowser {
   }
   async gate(signal) { stop(signal); const state = this.videoLimits.state(); if (!state.allowed) throw new Error(state.reason || '有限观看时段已结束，未发布评论。'); }
 
+  // 抖音网页会悬浮若干透明的全屏手势/交互层（slideList 的 fullscreen_capture_feedback、
+  // immersive 的 positionBox 等），间歇性拦截真实鼠标事件——按钮看得见、字打得进，
+  // 但 page.mouse 的点击全被这些层吃掉，发送永远不生效。
+  // 修法：点击前按坐标检查 elementFromPoint，把挡在目标前面的悬浮层 pointer-events:none（可逆的 style，不动结构）。
+  async clearPointerBlockers(page, point, signal) {
+    if (!point) return;
+    await page.evaluate(({ x, y }) => {
+      for (let depth = 0; depth < 6; depth++) {
+        const top = document.elementFromPoint(x, y);
+        if (!top) return;
+        const hit = top.closest('.commentInput-right-ct, [class*="commentInput-right"], .comment-input-inner-container, .public-DraftEditor-content, [contenteditable="true"]');
+        if (hit) return; // 已经点到我们的目标区域，无需再清。
+        top.style.pointerEvents = 'none'; // 悬浮层让路，继续探测下一层。
+      }
+    }, { x: point.x, y: point.y }).catch(() => {});
+    if (signal) stop(signal);
+  }
+
   // 展开评论区：默认是折叠的，必须点评论图标。
   async openPanel(page, signal) {
     const opened = () => page.evaluate(sel => {
@@ -197,6 +215,8 @@ export class CommentBrowser {
   async activateEditor(page, signal) {
     const area = page.locator(INPUT_AREA).filter({ visible: true }).first();
     if (await area.count() === 0) return null;
+    const areaBox = await area.boundingBox().catch(() => null);
+    await this.clearPointerBlockers(page, areaBox ? { x: areaBox.x + areaBox.width / 2, y: areaBox.y + areaBox.height / 2 } : null, signal);
     await area.click({ timeout: 5000 }).catch(() => {});
     const deadline = Date.now() + 4000;
     while (Date.now() < deadline) {
@@ -312,13 +332,16 @@ export class CommentBrowser {
         const releaseDispatch = await authorize.beginDispatch();
         if (typeof releaseDispatch !== 'function') throw new Error('最终发布未取得可释放的本机许可。');
         try {
+          const point = await this.clickPoint(send);
+          await this.clearPointerBlockers(page, point, signal);
           this.record(operation); clicked = true;
-          await humanClick(page, await this.clickPoint(send), { random: this.random, signal });
+          await humanClick(page, point, { random: this.random, signal });
         } finally { releaseDispatch(); }
 
         // 成功判据：评论条数增加，且首条是新发的那条（相对时间显示「刚刚」或文本命中）。
         // 实测发布后输入框不清空，故不用「草稿清空」当条件。
-        const deadline = Date.now() + 15000;
+        // 15s 太短：页面忙碌时一次 snapshot 就要 1-2 秒，新评论渲染也要时间，实测确认耗时 18-25 秒。
+        const deadline = Date.now() + 30000;
         while (Date.now() < deadline) {
           stop(signal);
           await waitForCommentTick(400, undefined, { signal });

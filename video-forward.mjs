@@ -10,7 +10,7 @@ import { VideoLimits } from './video-limits.mjs';
 
 const stop = signal => signal?.throwIfAborted();
 import {writeDurableReceiptFile as write,createCommentReceiptBaseline,createShareReceiptBaseline,checkReceiptBaseline,preserveReceiptBaseline} from './receipt-baseline.mjs';
-import {readCommentSelfIdentity} from './comment-browser.mjs';
+import {readCommentSelfIdentity} from './comment-browser.mjs?v=22';
 import {isRecoverableSharePreflight} from './autonomous-share.mjs';
 
 export function canonicalVideoUrl(value) {

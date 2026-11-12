@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { ApiAgent, redact, watchDecisionMessages, parseWatchDecision } from './api-agent.mjs?v=20';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
 import { AutonomousShare, isSharePreflightNotSent } from './autonomous-share.mjs?v=9';
-import { AutonomousComments } from './autonomous-comments.mjs?v=9';
+import { AutonomousComments } from './autonomous-comments.mjs?v=10';
 import { PublicCommentAgent } from './public-comment-agent.mjs?v=9';
 import { InteractionGate } from './interaction-gate.mjs';
 import { AgentConfig } from './agent-config.mjs';
@@ -311,7 +311,13 @@ export class AutonomousWatch {
     return this.commentPaused ? { ...context, enabled: false } : context;
   }
   // 评论只是观看的附加动作：可修复的失败记一笔跳过并继续刷；只有结果不明或连续修不好才停。
-  recordCommentSkip(videoId, reason) {
+  // benign=true 的跳过（如同一个作品已有评论记录的防重复拒绝）不是故障：换一个作品就能评，
+  // 不该累计进「连续失败」，否则模型长时间 stay 在已评过的视频上会把评论整个暂停掉。
+  recordCommentSkip(videoId, reason, benign = false) {
+    if (benign) {
+      this.onEvent({ type: 'watch.comment-skipped', videoId, reason, benign: true, message: `这个作品不评（${reason}），等下一个作品再试。` });
+      return;
+    }
     this.commentSkipStreak = (this.commentSkipStreak || 0) + 1;
     this.onEvent({ type: 'watch.comment-skipped', videoId, reason, consecutive: this.commentSkipStreak, message: `这条评论没有发出去（${reason}），已跳过并继续观看。` });
     if (this.commentSkipStreak < COMMENT_LIMITS.maxConsecutiveSkips) return;
@@ -416,7 +422,7 @@ export class AutonomousWatch {
   // 模板评论：正文本地抽，完全不调用模型，也不做「够不够格」的判定。
   // 时机由程序的定时器决定（watch.commentEverySeconds），这里只负责发出去。
   async publishTemplatedComment({ evidenceId, videoId, freshState }) {
-    if (freshState?.video?.id !== videoId) { this.recordCommentSkip(videoId, '评论前作品已变化。'); return null; }
+    if (freshState?.video?.id !== videoId) { this.recordCommentSkip(videoId, '评论前作品已变化。', true); return null; }
     const gate = this.getGate();
     if (this.commentPaused) return null;
     let text;
@@ -486,7 +492,7 @@ export class AutonomousWatch {
     } catch (error) {
       // 停止或时限变化属于观看本身的状态，仍按原样结束本轮。
       this.assertAllowed();
-      this.recordCommentSkip(videoId, error?.message || String(error));
+      this.recordCommentSkip(videoId, error?.message || String(error), /同一作品已处理过评论/.test(error?.message || String(error)));
       return null;
     }
     this.onEvent({ type: 'watch.comment', delivery, usage });

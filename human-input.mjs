@@ -101,21 +101,26 @@ export function normalizeDraft(value) { return String(value ?? '').replace(/[\u2
 
 // 清空编辑器。Draft 用 execCommand 直接改 DOM 会让内部 state 与 DOM 脱节（表现为内容反复累加），
 // 必须先聚焦、全选、再按退格，让 Draft 自己处理删除。
+// 实测要点：locator.click 有时会被抖音悬浮层拦掉（返回了但焦点没进去），此时 Control+A 选中的是页面而不是输入框，
+// 删除自然无效、旧草稿留在原地，下一次输入就变成追加。所以每次按键前都要回读校验，焦点没了就重新点。
 export async function clearEditor(page, locator) {
-  await locator.click({ timeout: 5000 }).catch(() => {});
-  await new Promise(resolve => setTimeout(resolve, 120));
-  await page.keyboard.press('Control+A');
-  await new Promise(resolve => setTimeout(resolve, 80));
-  await page.keyboard.press('Backspace');
-  await new Promise(resolve => setTimeout(resolve, 200));
-  // 还残留就再多删几次（Draft 偶尔需要逐段删）。
-  for (let i = 0; i < 3; i++) {
-    const left = normalizeDraft(await readEditorText(locator));
-    if (!left) return;
-    await page.keyboard.press('Control+A');
-    await page.keyboard.press('Backspace');
+  const stillThere = async () => normalizeDraft(await readEditorText(locator));
+  for (let round = 0; round < 4; round++) {
+    if (!await stillThere()) return;
+    await locator.click({ timeout: 3000 }).catch(() => {});
     await new Promise(resolve => setTimeout(resolve, 150));
+    // 三次点击选中整段（Draft 原生支持），再补一次 Control+A 兜底短文本。
+    const box = await locator.boundingBox().catch(() => null);
+    if (box && box.width > 2 && box.height > 2) {
+      await page.mouse.click(box.x + box.width / 2, box.y + Math.min(box.height / 2, 20), { clickCount: 3 }).catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, 120));
+    }
+    await page.keyboard.press('Control+A');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    await page.keyboard.press('Backspace');
+    await new Promise(resolve => setTimeout(resolve, 250));
   }
+  // 还有残留说明清不掉，交给上层保留草稿、不要发出去（宁可少发一条，也不发串行的话）。
 }
 
 // DraftEditor 必须先真实点击把焦点放进去，否则首字会被吞。
@@ -130,12 +135,14 @@ export async function ensureEditorText(page, locator, text, { random = Math.rand
     if (current && !expected.includes(current)) return false;
     await clearEditor(page, locator);
     current = normalizeDraft(await readEditorText(locator));
-    if (current) continue;
+    // 清空失败就再试一轮（不直接用旧内容发出去，避免发出串行拼接的话）。
+    if (current) { if (attempt === attempts - 1) return false; continue; }
     // 关键：真实点击编辑器，等焦点稳定，再逐字输入。
     await locator.click({ timeout: 5000 }).catch(() => {});
     await new Promise(resolve => setTimeout(resolve, Math.round(between(150, 320, random))));
+    // 输入前后都核对：焦点没进去会整体丢字，这时重来，不要带着半截内容发出去。
     await typeHumanly(page, expected, { random, signal });
-    await new Promise(resolve => setTimeout(resolve, Math.round(between(150, 300, random))));
+    await new Promise(resolve => setTimeout(resolve, Math.round(between(200, 400, random))));
     current = normalizeDraft(await readEditorText(locator));
     if (current === expected) return true;
   }

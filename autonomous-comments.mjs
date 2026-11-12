@@ -120,19 +120,24 @@ export class AutonomousComments {
     const token = randomUUID(); let descriptor;
     try { descriptor = fs.openSync(this.files.send, 'wx', 0o600); } catch (error) { if (error.code === 'EEXIST') throw fail('另一个入口正在评论，或上次评论发送锁需要核对。'); throw error; }
     try { fs.writeFileSync(descriptor, JSON.stringify({ pid: process.pid, token })); } finally { fs.closeSync(descriptor); }
-    const abort = new AbortController(), combined = AbortSignal.any([abort.signal, ...(signal ? [signal] : []), AbortSignal.timeout(30_000)]), operationId = randomUUID(), completion = Promise.withResolvers();
+    // 30s 太短：实测从打开评论区到确认新评论出现，正常要 38-65 秒（页面忙碌时每次鼠标移动都要等主线程）。
+    // 之前每条评论都在第 30 秒被这里掐断，落成 uncertain，再累计 3 次就把评论整个暂停了。
+    const abort = new AbortController(), combined = AbortSignal.any([abort.signal, ...(signal ? [signal] : []), AbortSignal.timeout(120_000)]), operationId = randomUUID(), completion = Promise.withResolvers();
     let reserved = false, clicking = false, finished = false, releaseDispatch; this.active = { abort, completion: completion.promise };
     try {
       let sessionId;
       this.control(() => {
         const time = this.allowed(input, { signal: combined, watchRunId }); sessionId = time.session.id; const ledger = this.ledger();
-        if (ledger.operations.some(item => item.videoId === input.videoId)) throw fail('同一作品已处理过评论，未跨日或重启后自动重复发布。');
+        // 只拦「真发出去过」或「还等着核对」的记录。resolved-not-sent 明确表示上次没发成功，
+        // 那时拦着重试没有任何意义，反而让这个作品永远评不了。
+        const BLOCKING = new Set(['reserved', 'clicking', 'confirmed', 'uncertain', 'resolved-confirmed']);
+        if (ledger.operations.some(item => item.videoId === input.videoId && BLOCKING.has(item.status))) throw fail('同一作品已处理过评论，未跨日或重启后自动重复发布。');
         const date = day(this.now()); ledger.days[date] = (ledger.days[date] || 0) + 1; ledger.sessions[sessionId] = (ledger.sessions[sessionId] || 0) + 1;
         ledger.operations.push({ operationId, evidenceId: input.evidenceId, videoId: input.videoId, text: input.text, day: date, sessionId, runId: watchRunId, source: this.source, pid: process.pid, status: 'reserved', startedAt: new Date(this.now()).toISOString() }); write(this.files.ledger, ledger); reserved = true;      });
       const authorize = ({ phase, videoId } = {}) => { if (finished || videoId !== input.videoId || !['prepare', 'monitor', 'before-click'].includes(phase)) throw fail('可信评论授权与当前作品不一致。'); this.allowed(input, { signal: combined, watchRunId, operationId, sessionId }); if (phase === 'before-click') { if (clicking) throw fail('这条评论已授权一次发布，未再次点击。'); this.update(operationId, { status: 'clicking' }); clicking = true; } return true; };
       authorize.beginDispatch = () => { if (finished || !clicking || releaseDispatch) throw fail('没有一次有效的评论最终输入许可。'); const release = this.acquireControl(); try { this.allowed(input, { signal: combined, watchRunId, operationId, sessionId }); } catch (error) { release(); throw error; } releaseDispatch = release; return () => { releaseDispatch?.(); releaseDispatch = null; }; };
       let post = this.post;
-      if (!post) { let commenter = await (this.getCommenter ? this.getCommenter() : this.controller?.getCommenter?.()); if (!commenter) { const { CommentBrowser } = await import('./comment-browser.mjs'); this.ownedCommenter ??= new CommentBrowser({ source: this.source, videoLimits: this.videoLimits, stateDir: this.stateDir }); commenter = this.ownedCommenter; } if (typeof commenter.post !== 'function') throw fail('当前评论适配尚未提供可核对的发布接口。'); post = commenter.post.bind(commenter); }
+      if (!post) { let commenter = await (this.getCommenter ? this.getCommenter() : this.controller?.getCommenter?.()); if (!commenter) { const { CommentBrowser } = await import('./comment-browser.mjs?v=22'); this.ownedCommenter ??= new CommentBrowser({ source: this.source, videoLimits: this.videoLimits, stateDir: this.stateDir }); commenter = this.ownedCommenter; } if (typeof commenter.post !== 'function') throw fail('当前评论适配尚未提供可核对的发布接口。'); post = commenter.post.bind(commenter); }
       const result = await post({ expectedVideoId: input.videoId, text: input.text }, { signal: combined, authorize, autonomousRunId: watchRunId });
       // 浏览器层已经用「评论数 +1 且首条显示刚刚」确认过了，那就是真的发出去了。
       // 原来这里还要求 commentId，但抖音评论没有稳定的 ID 属性（data-comment-id 实测为 null），
